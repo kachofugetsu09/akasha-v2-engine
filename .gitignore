@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.basedpyright/
+.coverage
+build/
+dist/
+*.egg-info/
+.venv/
+private-data/
+*.db
+*.db-shm
+*.db-wal
+*.tmp
+*.bak-*
+
