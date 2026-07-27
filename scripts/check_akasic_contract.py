@@ -21,6 +21,8 @@ def main() -> None:
     # 2. Check structural contracts without constructing network resources.
     from akasha.engine import AkashaMemoryEngine
     from akasha.memory_plugin import MemoryPlugin as AkashaPlugin
+    from akasha.plugin import AkashaPlugin as HostPlugin
+    from agent.plugins import Plugin
     from core.memory.engine import MemoryEngine
     from core.memory.plugin import MemoryPlugin
 
@@ -30,11 +32,14 @@ def main() -> None:
         raise TypeError("AkashaMemoryEngine violates MemoryEngine")
     if not isinstance(plugin, MemoryPlugin):
         raise TypeError("Akasha MemoryPlugin violates host protocol")
+    if not isinstance(HostPlugin(), Plugin):
+        raise TypeError("Akasha host plugin violates Plugin protocol")
     print(
         json.dumps(
             {
                 "engine_contract": True,
                 "plugin_contract": True,
+                "host_plugin_contract": True,
                 "plugin_id": plugin.plugin_id,
             },
             sort_keys=True,
