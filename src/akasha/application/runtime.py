@@ -44,12 +44,14 @@ class OnlineMemoryRuntime:
         index_path: Path,
         memory_path: Path,
         embedding_model: str,
+        embedding_dimension: int | None,
         config: MemoryConfig,
     ) -> None:
         self.sessions_path = sessions_path
         self.index_path = index_path
         self.memory_path = memory_path
         self.embedding_model = embedding_model
+        self.embedding_dimension = embedding_dimension
         self.config = config
         self._writer_lease = WriterLease(memory_path)
         self.cycle = self._restore_or_replay()
@@ -116,7 +118,10 @@ class OnlineMemoryRuntime:
         build_sparse_index(
             self.sessions_path,
             self.index_path,
-            BuildConfig(embedding_model=self.embedding_model),
+            BuildConfig(
+                embedding_model=self.embedding_model,
+                embedding_dimension=self.embedding_dimension,
+            ),
         )
         turns = load_turns(self.index_path)
         if len(turns) <= self.cycle.state_version:
@@ -171,7 +176,10 @@ class OnlineMemoryRuntime:
         result = build_sparse_index(
             self.sessions_path,
             self.index_path,
-            BuildConfig(embedding_model=self.embedding_model),
+            BuildConfig(
+                embedding_model=self.embedding_model,
+                embedding_dimension=self.embedding_dimension,
+            ),
         )
         turns = load_turns(self.index_path) if result.discovered_turns else []
         if not self.memory_path.exists():

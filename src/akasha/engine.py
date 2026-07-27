@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from session.embedding_store import MessageEmbeddingStore
 from .application.cycle import RetrievalTicket
 from .application.runtime import OnlineMemoryRuntime
 from .config import AkashaConfig, resolve_workspace_path
+from .domain.model import Turn
 
 if TYPE_CHECKING:
     from bus.event_bus import EventBus
@@ -53,6 +55,18 @@ class PendingRetrieval:
     query_timestamp: datetime
     query_text: str
     query_dense: np.ndarray
+
+
+@dataclass(frozen=True)
+class RetrievalRecords:
+    """Keep direct dense recall separate from explicit pattern completion."""
+
+    dense: tuple[MemoryRecord, ...]
+    completion: tuple[MemoryRecord, ...]
+
+    @property
+    def combined(self) -> list[MemoryRecord]:
+        return [*self.dense, *self.completion]
 
 
 class AkashaMemoryEngine:
@@ -125,6 +139,7 @@ class AkashaMemoryEngine:
                 akasha_config.db_path,
             ),
             embedding_model=embedding.model,
+            embedding_dimension=embedding.output_dimensionality,
             config=akasha_config.memory_config(),
         )
 
@@ -181,44 +196,52 @@ class AkashaMemoryEngine:
             dtype=np.float32,
         )
         with self._lock:
-            _, ticket = self._runtime.query_turn(
+            cue, ticket = self._runtime.query_turn(
                 text=text,
                 dense=dense,
                 session_key=request.scope.session_key,
                 timestamp=request.timestamp,
             )
-            records = self._records(ticket, request)
-            if (
-                request.effect == "stateful"
-                and request.scope.session_key
-            ):
-                self._pending[request.scope.session_key] = (
-                    PendingRetrieval(
-                        ticket,
-                        request.timestamp,
-                        text,
-                        dense.copy(),
+            lanes = self._records(ticket, cue, request)
+            retains_ticket = (
+                request.intent == "context"
+                and request.effect == "stateful"
+                and bool(request.scope.session_key)
+            )
+            if retains_ticket:
+                session_key = request.scope.session_key
+                if not session_key:
+                    raise RuntimeError(
+                        "stateful context query lost its session key"
                     )
+                self._pending[session_key] = PendingRetrieval(
+                    ticket,
+                    request.timestamp,
+                    text,
+                    dense.copy(),
                 )
-
         # 3. Render context only for the runtime context-injection intent.
         text_block = (
-            self._context_block(records)
+            self._context_block(lanes, request.timestamp)
             if request.intent == "context"
             else ""
         )
         return MemoryQueryResult(
             text_block=text_block,
-            records=records,
+            records=lanes.combined,
             trace={
                 "engine": "akasha",
-                "effect": request.effect,
+                "requested_effect": request.effect,
+                "effect": (
+                    "stateful" if retains_ticket else "read_only"
+                ),
                 "state_version": ticket.state_version,
                 "seed_count": len(ticket.evidence.seed),
+                "dense_count": len(lanes.dense),
                 "active_basin_count": (
                     ticket.completion.active_basin_count
                 ),
-                "completion_count": len(ticket.completion.items),
+                "completion_count": len(lanes.completion),
                 "pushes": ticket.completion.pushes,
                 "residual_l1": ticket.completion.residual_l1,
             },
@@ -431,7 +454,12 @@ class AkashaMemoryEngine:
         """Persist embeddings and apply one canonical MemoryCycle commit."""
 
         # 1. Respect the host's explicit exclusion and validate stable IDs.
-        if bool((event.extra or {}).get("skip_post_memory")):
+        if (
+            event.session_key.split(":", 1)[0] == "scheduler"
+            or bool((event.extra or {}).get("skip_post_memory"))
+        ):
+            with self._lock:
+                self._pending.pop(event.session_key, None)
             return
         user_id = event.persisted_user_message_id
         assistant_id = event.assistant_message_id
@@ -484,62 +512,119 @@ class AkashaMemoryEngine:
     def _records(
         self,
         ticket: RetrievalTicket,
+        cue: Turn,
         request: MemoryQuery,
-    ) -> list[MemoryRecord]:
+    ) -> RetrievalRecords:
+        """Select direct dense and explicit completion as independent lanes."""
+
+        # 1. Select dense evidence before chronological presentation.
         turns = self._runtime.cycle.turns
-        limit = (
+        completion_limit = (
             self._config.context_recall_limit
             if request.intent == "context"
             else request.limit
         )
-        records = []
+        dense_limit = min(5, request.limit)
+        completion_nodes = {
+            item.node_id: item for item in ticket.completion.items
+        }
+        dense_candidates = []
+        for turn in turns:
+            score = _dense_score(cue.user_dense, turn)
+            if score is None or not _matches_filters(
+                turn,
+                ("direct_dense",),
+                request,
+            ):
+                continue
+            dense_candidates.append((turn.node_id, score))
+        dense_candidates.sort(key=lambda item: (-item[1], item[0]))
+        dense_nodes = {
+            node_id for node_id, _ in dense_candidates[:dense_limit]
+        }
+        dense_records = [
+            _memory_record(
+                turns[node_id],
+                score=score,
+                lane="dense",
+                sources=("direct_dense",),
+                basin_ids=(),
+                injected=request.intent == "context",
+                also_completed=node_id in completion_nodes,
+            )
+            for node_id, score in dense_candidates[:dense_limit]
+        ]
+
+        # 2. Fill completion after stable-ID dedupe against the dense lane.
+        completion_records = []
         for item in ticket.completion.items:
+            if item.node_id in dense_nodes:
+                continue
             turn = turns[item.node_id]
             if not _matches_filters(turn, item.sources, request):
                 continue
-            records.append(
-                MemoryRecord(
-                    id=turn.turn_id,
-                    kind="episodic_turn",
-                    summary=_turn_summary(turn.user_text, turn.assistant_text),
+            completion_records.append(
+                _memory_record(
+                    turn,
                     score=item.score,
-                    engine_kind="akasha",
-                    evidence=[
-                        EvidenceRef(
-                            kind="message_range",
-                            refs=[
-                                turn.user_message_id,
-                                turn.assistant_message_id,
-                            ],
-                            source_ref=turn.session_key,
-                        )
-                    ],
-                    signals={
-                        "sources": list(item.sources),
-                        "basin_ids": list(item.basin_ids),
-                        "completion": True,
-                    },
+                    lane="completion",
+                    sources=item.sources,
+                    basin_ids=item.basin_ids,
                     injected=request.intent == "context",
+                    also_completed=False,
                 )
             )
-            if len(records) == limit:
+            if len(completion_records) == completion_limit:
                 break
-        return records
 
-    def _context_block(self, records: list[MemoryRecord]) -> str:
-        parts = ["<akasha_explicit_memory>"]
-        used = len(parts[0])
-        for record in records:
-            line = (
-                f"\n- source_ref={record.evidence[0].refs} "
-                f"{record.summary}"
+        # 3. Ranking chooses membership; chronology chooses presentation.
+        return RetrievalRecords(
+            dense=tuple(_sort_records_by_time(dense_records)),
+            completion=tuple(
+                _sort_records_by_time(completion_records)
+            ),
+        )
+
+    def _context_block(
+        self,
+        lanes: RetrievalRecords,
+        timestamp: datetime,
+    ) -> str:
+        """Render the legacy left/right memory layout within one budget."""
+
+        # 1. Render each lane without adding per-item semantic labels.
+        if not lanes.dense and not lanes.completion:
+            return ""
+        parts = [
+            (
+                "# Akasha memory now="
+                f"{timestamp.astimezone(ZoneInfo('Asia/Shanghai')):%m-%d}"
             )
-            if used + len(line) > self._config.inject_max_chars:
-                break
-            parts.append(line)
-            used += len(line)
-        parts.append("\n</akasha_explicit_memory>")
-        return "".join(parts)
+        ]
+        if lanes.dense:
+            parts.append(
+                _format_records(
+                    "## 左脑记忆：精确回忆",
+                    lanes.dense,
+                )
+            )
+        if lanes.completion:
+            parts.append(
+                _format_records(
+                    "## 右脑联想：潜意识第一反应",
+                    lanes.completion,
+                )
+            )
+
+        # 2. Apply the host injection budget after complete formatting.
+        text = "\n\n".join(parts)
+        if len(text) <= self._config.inject_max_chars:
+            return text
+        omitted = len(text) - self._config.inject_max_chars
+        return (
+            text[: self._config.inject_max_chars].rstrip()
+            + f"\n...[Akasha 已截断 {omitted} 字]"
+        )
 
     @staticmethod
     def _turn_row(turn) -> dict[str, object]:
@@ -613,8 +698,117 @@ def _upsert_embeddings(
         )
 
 
+def _memory_record(
+    turn: Turn,
+    *,
+    score: float,
+    lane: str,
+    sources: tuple[str, ...],
+    basin_ids: tuple[str, ...],
+    injected: bool,
+    also_completed: bool,
+) -> MemoryRecord:
+    """Expose one historical turn with stable source identity."""
+
+    preview = _assistant_preview(turn.assistant_text)
+    return MemoryRecord(
+        id=turn.turn_id,
+        kind="episodic_turn",
+        summary=_turn_summary(turn.user_text, preview),
+        score=score,
+        engine_kind="akasha",
+        evidence=[
+            EvidenceRef(
+                kind="message_range",
+                refs=[
+                    turn.user_message_id,
+                    turn.assistant_message_id,
+                ],
+                source_ref=turn.session_key,
+            )
+        ],
+        signals={
+            "lane": lane,
+            "sources": list(sources),
+            "basin_ids": list(basin_ids),
+            "completion": lane == "completion",
+            "also_completed": also_completed,
+            "started_at": turn.started_at,
+            "user_text": turn.user_text,
+            "assistant_preview": preview,
+        },
+        injected=injected,
+    )
+
+
+def _dense_score(
+    query: np.ndarray | None,
+    turn: Turn,
+) -> float | None:
+    if query is None:
+        return None
+    scores = [
+        float(np.dot(query, vector))
+        for vector in (turn.user_dense, turn.assistant_dense)
+        if vector is not None
+    ]
+    return max(scores) if scores else None
+
+
+def _assistant_preview(text: str) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= 50:
+        return normalized
+    return normalized[:50] + "..."
+
+
 def _turn_summary(user: str, assistant: str) -> str:
     return f"用户：{user}\n助手：{assistant}"
+
+
+def _sort_records_by_time(
+    records: list[MemoryRecord],
+) -> list[MemoryRecord]:
+    return sorted(
+        records,
+        key=lambda record: (
+            _parse_turn_time(str(record.signals["started_at"])),
+            record.id.encode("utf-8"),
+        ),
+        reverse=True,
+    )
+
+
+def _format_records(
+    title: str,
+    records: tuple[MemoryRecord, ...],
+) -> str:
+    lines = [title]
+    for record in records:
+        user = str(record.signals["user_text"])
+        assistant = str(record.signals["assistant_preview"])
+        timestamp = _parse_turn_time(
+            str(record.signals["started_at"])
+        ).astimezone(ZoneInfo("Asia/Shanghai"))
+        refs = record.evidence[0].refs
+        lines.append(
+            f"- user={_json_string(user)} "
+            f"assistant={_json_string(assistant)} "
+            f"t={timestamp:%m-%d} "
+            f"source_ref={json.dumps(refs, ensure_ascii=False)}"
+        )
+    return "\n".join(lines)
+
+
+def _json_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _parse_turn_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    return parsed
 
 
 def _matches_filters(

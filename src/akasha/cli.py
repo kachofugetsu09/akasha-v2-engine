@@ -22,7 +22,12 @@ from pathlib import Path
 from .application.rebuild import rebuild_memory
 from .config import load_akasha_config
 from .domain.model import MemoryConfig
-from .infrastructure.sparse_index import BuildConfig, build_sparse_index
+from .infrastructure.sparse_index import (
+    BuildConfig,
+    EmbeddingAudit,
+    audit_source_embeddings,
+    build_sparse_index,
+)
 
 
 def main() -> None:
@@ -69,6 +74,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-session", default="")
     parser.add_argument("--max-turns", type=int)
     parser.add_argument("--embedding-model", default="text-embedding-v4")
+    parser.add_argument("--embedding-dim", type=int)
+    parser.add_argument("--embedding-report", type=Path)
+    parser.add_argument(
+        "--require-complete-embeddings",
+        action="store_true",
+    )
     parser.add_argument("--restart", type=float, default=0.25)
     parser.add_argument("--tolerance", type=float, default=1e-7)
     parser.add_argument("--learning-rate", type=float, default=0.5)
@@ -101,16 +112,41 @@ def _rebuild_from_sessions(
 ):
     """Build a private temporary sparse index before atomic memory output."""
 
-    # 1. Derive the complete index from an immutable sessions source.
+    # 1. Audit the immutable source before touching the current sidecar.
+    build_config = BuildConfig(
+        embedding_model=arguments.embedding_model,
+        embedding_dimension=arguments.embedding_dim,
+    )
+    audit = audit_source_embeddings(
+        arguments.sessions_db,
+        build_config,
+    )
+    report_path = arguments.embedding_report
+    if report_path is not None or not audit.complete:
+        _write_embedding_audit(
+            report_path
+            or arguments.db_path.with_name(
+                f"{arguments.db_path.name}.embedding-audit.json"
+            ),
+            audit,
+            build_config,
+        )
+    if arguments.require_complete_embeddings and not audit.complete:
+        raise ValueError(
+            "sessions source has "
+            f"{len(audit.issues)} invalid or missing embeddings"
+        )
+
+    # 2. Derive the complete index from the audited sessions source.
     with tempfile.TemporaryDirectory(prefix="akasha-rebuild-") as directory:
         index_path = Path(directory) / "sparse-index.db"
         build_sparse_index(
             arguments.sessions_db,
             index_path,
-            BuildConfig(embedding_model=arguments.embedding_model),
+            build_config,
         )
 
-        # 2. Replay the exact same MemoryCycle used by online growth.
+        # 3. Replay the exact same MemoryCycle used by online growth.
         target_sequences = tuple(arguments.seq)
         target_session = arguments.target_session
         if target_sequences and not target_session:
@@ -125,6 +161,43 @@ def _rebuild_from_sessions(
             target_session=target_session,
             max_turns=arguments.max_turns,
         )
+
+
+def _write_embedding_audit(
+    path: Path,
+    audit: EmbeddingAudit,
+    config: BuildConfig,
+) -> None:
+    """Atomically publish a machine-readable source preflight report."""
+
+    # 1. Serialize deterministic evidence without runtime timestamps.
+    payload = {
+        "embedding_model": config.embedding_model,
+        "expected_dimension": config.embedding_dimension,
+        "audit": asdict(audit),
+    }
+    text = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+    # 2. Replace only the requested report after a complete local write.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        handle.write(text)
+        temporary = Path(handle.name)
+    temporary.replace(path)
 
 
 def _backup_existing(path: Path) -> Path | None:

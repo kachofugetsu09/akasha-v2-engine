@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,7 @@ def test_online_commit_matches_clean_rebuild(tmp_path: Path) -> None:
         index_path=online_index,
         memory_path=online_memory,
         embedding_model="text-embedding-v4",
+        embedding_dimension=2,
         config=config,
     )
 
@@ -72,6 +74,7 @@ def test_online_runtime_rejects_a_second_writer(tmp_path: Path) -> None:
         index_path=index,
         memory_path=memory,
         embedding_model="text-embedding-v4",
+        embedding_dimension=2,
         config=MemoryConfig(),
     )
 
@@ -81,6 +84,7 @@ def test_online_runtime_rejects_a_second_writer(tmp_path: Path) -> None:
             index_path=index,
             memory_path=memory,
             embedding_model="text-embedding-v4",
+            embedding_dimension=2,
             config=MemoryConfig(),
         )
 
@@ -90,6 +94,7 @@ def test_online_runtime_rejects_a_second_writer(tmp_path: Path) -> None:
         index_path=index,
         memory_path=memory,
         embedding_model="text-embedding-v4",
+        embedding_dimension=2,
         config=MemoryConfig(),
     )
     replacement.close()
@@ -150,11 +155,13 @@ def _create_sessions(path: Path) -> None:
                 seq INTEGER NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                extra TEXT,
                 ts TEXT NOT NULL,
                 UNIQUE(session_key, seq)
             );
             CREATE TABLE message_embeddings (
                 message_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
                 model TEXT NOT NULL,
                 embedding BLOB NOT NULL,
                 dim INTEGER NOT NULL,
@@ -176,7 +183,7 @@ def _append_turn(
     vector = np.asarray(raw_vector, dtype=np.float32)
     with sqlite3.connect(path) as connection:
         connection.executemany(
-            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     f"message:{sequence}",
@@ -184,6 +191,7 @@ def _append_turn(
                     sequence,
                     "user",
                     text,
+                    None,
                     user_time.isoformat(),
                 ),
                 (
@@ -192,21 +200,26 @@ def _append_turn(
                     sequence + 1,
                     "assistant",
                     f"answer {text}",
+                    None,
                     assistant_time.isoformat(),
                 ),
             ],
         )
         connection.executemany(
-            "INSERT INTO message_embeddings VALUES (?, ?, ?, ?)",
+            "INSERT INTO message_embeddings VALUES (?, ?, ?, ?, ?)",
             [
                 (
                     f"message:{sequence}",
+                    hashlib.sha256(text.encode()).hexdigest(),
                     "text-embedding-v4",
                     vector.tobytes(),
                     vector.size,
                 ),
                 (
                     f"message:{sequence + 1}",
+                    hashlib.sha256(
+                        f"answer {text}".encode()
+                    ).hexdigest(),
                     "text-embedding-v4",
                     vector.tobytes(),
                     vector.size,

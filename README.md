@@ -29,8 +29,9 @@ query dense / BM25 / causal burst / time
 - 没有 fast/slow/tag/reinforce 或用户确认分支；
 - 相同事实源、embedding、配置与代码产生相同逻辑状态。
 
-缺少 dense 的完整 turn 仍通过 BM25 和时间证据进入记忆；已存在的坏向量、
-损坏数据库、逆序历史或身份冲突会直接失败。
+算法层允许缺少 dense 的完整 turn 通过 BM25 和时间证据进入记忆；宿主迁移
+可以用严格 preflight 要求所有非空对话消息都具有内容匹配、维度一致的冻结
+向量。已存在的坏向量、损坏数据库、逆序历史或身份冲突会直接失败。
 
 ## 安装
 
@@ -50,11 +51,15 @@ akasha-rebuild \
   --sessions-db /path/to/sessions.db \
   --db-path /path/to/akasha.db \
   --embedding-model text-embedding-v4 \
+  --embedding-dim 1024 \
+  --require-complete-embeddings \
+  --embedding-report /path/to/embedding-audit.json \
   --run-report /path/to/rebuild.json
 ```
 
 如果目标数据库已经存在，CLI 会先生成带 UTC 时间戳的 `.bak-*` 备份，再原子
-替换目标。构建中使用的临时稀疏索引不会写入仓库。
+替换目标。严格 preflight 在备份和替换之前完成；失败时保留原数据库并给出
+逐消息报告。构建中使用的临时稀疏索引不会写入仓库。
 
 要把指定 query 的完整召回保存为本地审计报告：
 
@@ -74,6 +79,9 @@ python scripts/export_recall_report.py \
 `MemoryPlugin`/`MemoryEngine` protocol。宿主在 query 阶段得到非变异的
 `RetrievalTicket`；持久化 `TurnCommitted` 到达后，adapter 从真实消息 ID
 读取 turn、补齐 embedding，并调用同一个 cycle 完成学习和原子落库。
+自动 `context` 查询是唯一会保留 ticket 的读取入口；显式
+`recall_memory` 即使由宿主标记为 stateful，也按只读执行，不会覆盖本轮自动
+上下文或生成图学习。
 
 ```text
 MemoryEngine.query
@@ -95,7 +103,14 @@ adapter 契约可以对当前 Akasic Agent checkout 做结构检查：
 ```bash
 python scripts/check_akasic_contract.py \
   --host /path/to/akasic-agent
+
+python scripts/check_akasic_behavior.py \
+  --host /path/to/akasic-agent
 ```
+
+返回给 agent 的上下文分为两个集合：左脑固定为 dense top 5，右脑是图模式
+补全中排除相同稳定 turn ID 后的结果。集合成员先按各自证据选择，再分别按
+时间从近到远展示；assistant 仅展示标准化后的前 50 字。
 
 ## 机制
 

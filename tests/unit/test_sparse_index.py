@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ import numpy as np
 from akasha.infrastructure.sparse_index import (
     AppendOnlyViolation,
     BuildConfig,
+    audit_source_embeddings,
     build_sparse_index,
 )
 
@@ -83,19 +85,44 @@ class SparseIndexTest(unittest.TestCase):
     def test_indexes_turn_even_when_dense_cache_is_missing(self) -> None:
         base = datetime(2026, 1, 1, tzinfo=timezone.utc)
         rows = [
-            ("test:0", "test:one", 0, "user", "missing dense", base.isoformat()),
-            ("test:1", "test:one", 1, "assistant", "still indexed", (base + timedelta(seconds=5)).isoformat()),
+            (
+                "test:0",
+                "test:one",
+                0,
+                "user",
+                "missing dense",
+                None,
+                base.isoformat(),
+            ),
+            (
+                "test:1",
+                "test:one",
+                1,
+                "assistant",
+                "still indexed",
+                None,
+                (base + timedelta(seconds=5)).isoformat(),
+            ),
         ]
         with closing(sqlite3.connect(self.source)) as connection, connection:
-            connection.executemany("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)", rows)
+            connection.executemany(
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
 
         result = build_sparse_index(self.source, self.output, self._config())
+        audit = audit_source_embeddings(self.source, self._config())
 
         self.assertEqual(result.discovered_turns, 1)
         self.assertEqual(result.indexed_turns, 1)
         self.assertEqual(result.turns_missing_embeddings, 1)
         self.assertEqual(self._scalar("SELECT COUNT(*) FROM sparse_turns"), 1)
         self.assertEqual(self._scalar("SELECT COUNT(*) FROM turn_dense"), 0)
+        self.assertFalse(audit.complete)
+        self.assertEqual(
+            [issue.reason for issue in audit.issues],
+            ["missing", "missing"],
+        )
 
     def _config(self) -> BuildConfig:
         return BuildConfig()
@@ -110,11 +137,13 @@ class SparseIndexTest(unittest.TestCase):
                     seq INTEGER NOT NULL,
                     role TEXT NOT NULL,
                     content TEXT,
+                    extra TEXT,
                     ts TEXT NOT NULL,
                     UNIQUE(session_key, seq)
                 );
                 CREATE TABLE message_embeddings (
                     message_id TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
                     model TEXT NOT NULL,
                     embedding BLOB NOT NULL,
                     dim INTEGER NOT NULL,
@@ -133,28 +162,50 @@ class SparseIndexTest(unittest.TestCase):
     ) -> None:
         base = datetime(2026, 1, 1, tzinfo=timezone.utc)
         rows = [
-            (f"test:{seq}", "test:one", seq, "user", user_text, (base + timedelta(minutes=seq)).isoformat()),
+            (
+                f"test:{seq}",
+                "test:one",
+                seq,
+                "user",
+                user_text,
+                None,
+                (base + timedelta(minutes=seq)).isoformat(),
+            ),
             (
                 f"test:{seq + 1}",
                 "test:one",
                 seq + 1,
                 "assistant",
                 assistant_text,
+                None,
                 (base + timedelta(minutes=seq, seconds=5)).isoformat(),
             ),
         ]
         embeddings = [
-            (f"test:{seq}", "text-embedding-v4", np.asarray(user_vector, dtype=np.float32).tobytes(), 2),
+            (
+                f"test:{seq}",
+                hashlib.sha256(user_text.encode()).hexdigest(),
+                "text-embedding-v4",
+                np.asarray(user_vector, dtype=np.float32).tobytes(),
+                2,
+            ),
             (
                 f"test:{seq + 1}",
+                hashlib.sha256(assistant_text.encode()).hexdigest(),
                 "text-embedding-v4",
                 np.asarray(assistant_vector, dtype=np.float32).tobytes(),
                 2,
             ),
         ]
         with closing(sqlite3.connect(self.source)) as connection, connection:
-            connection.executemany("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)", rows)
-            connection.executemany("INSERT INTO message_embeddings VALUES (?, ?, ?, ?)", embeddings)
+            connection.executemany(
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            connection.executemany(
+                "INSERT INTO message_embeddings VALUES (?, ?, ?, ?, ?)",
+                embeddings,
+            )
 
     def _scalar(self, query: str):
         connection = sqlite3.connect(self.output)

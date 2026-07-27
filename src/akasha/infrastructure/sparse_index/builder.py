@@ -31,8 +31,35 @@ class BuildConfig:
     """Configure causal BM25 while leaving feature cardinality unconstrained."""
 
     embedding_model: str = "text-embedding-v4"
+    embedding_dimension: int | None = None
     bm25_k1: float = 1.2
     bm25_b: float = 0.75
+
+
+@dataclass(frozen=True)
+class EmbeddingIssue:
+    """Describe one source message that lacks a valid frozen embedding."""
+
+    message_id: str
+    session_key: str
+    seq: int
+    role: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class EmbeddingAudit:
+    """Summarize the frozen embedding boundary for eligible dialogue turns."""
+
+    eligible_turns: int
+    eligible_messages: int
+    valid_messages: int
+    dimension: int | None
+    issues: tuple[EmbeddingIssue, ...]
+
+    @property
+    def complete(self) -> bool:
+        return not self.issues
 
 
 @dataclass(frozen=True)
@@ -67,7 +94,7 @@ def build_sparse_index(
         _validate_index_version(output)
 
         # 2. Restore prior online state and identify append-only work.
-        turns, missing = _load_canonical_turns(source, config.embedding_model)
+        turns, missing = _load_canonical_turns(source, config)
         existing = _load_existing_turns(output)
         new_turns = _select_new_turns(turns, existing)
         lexical = _load_lexical_states(output)
@@ -83,6 +110,12 @@ def build_sparse_index(
             _persist_online_state(output, lexical, time_stats, stream_state)
             _set_metadata(output, "index_version", INDEX_VERSION)
             _set_metadata(output, "embedding_model", config.embedding_model)
+            if config.embedding_dimension is not None:
+                _set_metadata(
+                    output,
+                    "embedding_dimension",
+                    str(config.embedding_dimension),
+                )
             _set_metadata(
                 output,
                 "turns_missing_embeddings",
@@ -94,6 +127,49 @@ def build_sparse_index(
     finally:
         source.close()
         output.close()
+
+
+def audit_source_embeddings(
+    source_path: Path,
+    config: BuildConfig,
+) -> EmbeddingAudit:
+    """Audit eligible messages without mutating the sessions database."""
+
+    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+    source.row_factory = sqlite3.Row
+    try:
+        _validate_source(source)
+        messages = _source_messages(source)
+        pairs = _eligible_pairs(messages)
+        rows = source.execute(
+            """
+            SELECT message_id, content_hash, embedding, dim
+            FROM message_embeddings
+            WHERE model = ?
+            ORDER BY message_id
+            """,
+            (config.embedding_model,),
+        ).fetchall()
+        embeddings = {str(row["message_id"]): row for row in rows}
+        issues, valid_dimensions, required = _embedding_issues(
+            pairs,
+            embeddings,
+            config.embedding_dimension,
+        )
+    finally:
+        source.close()
+    dimension = (
+        next(iter(valid_dimensions))
+        if len(valid_dimensions) == 1
+        else config.embedding_dimension
+    )
+    return EmbeddingAudit(
+        eligible_turns=len(pairs),
+        eligible_messages=required,
+        valid_messages=required - len(issues),
+        dimension=dimension,
+        issues=tuple(issues),
+    )
 
 
 @dataclass(frozen=True)
@@ -135,35 +211,42 @@ def _validate_index_version(connection: sqlite3.Connection) -> None:
 
 def _load_canonical_turns(
     connection: sqlite3.Connection,
-    embedding_model: str,
+    config: BuildConfig,
 ) -> tuple[list[CanonicalTurn], int]:
     """Reconstruct every dialogue turn and count incomplete dense cache rows."""
 
     # 1. Read source rows and the selected embedding space.
-    messages = connection.execute(
-        "SELECT session_key, seq, id, role, content, ts FROM messages ORDER BY session_key, seq"
-    ).fetchall()
-    embeddings = {
-        row["message_id"]: _decode_embedding(row["embedding"], row["dim"])
-        for row in connection.execute(
-            "SELECT message_id, embedding, dim FROM message_embeddings WHERE model = ?",
-            (embedding_model,),
-        )
-    }
+    messages = _source_messages(connection)
+    pairs = _eligible_pairs(messages)
+    audit = _audit_rows(connection, pairs, config)
+    invalid = {issue.message_id for issue in audit.issues}
+    embeddings = {}
+    for row in connection.execute(
+        """
+        SELECT message_id, embedding, dim
+        FROM message_embeddings
+        WHERE model = ?
+        ORDER BY message_id
+        """,
+        (config.embedding_model,),
+    ):
+        message_id = str(row["message_id"])
+        if message_id not in invalid:
+            embeddings[message_id] = _decode_embedding(
+                row["embedding"],
+                row["dim"],
+            )
 
-    # 2. Pair each user message with only its immediate assistant reply.
-    grouped: dict[str, list[sqlite3.Row]] = defaultdict(list)
-    for message in messages:
-        grouped[message["session_key"]].append(message)
-    turns: list[CanonicalTurn] = []
-    missing_embeddings = 0
-    for session_messages in grouped.values():
-        for user, assistant in zip(session_messages, session_messages[1:]):
-            if user["role"] != "user" or assistant["role"] != "assistant":
-                continue
-            if user["id"] not in embeddings or assistant["id"] not in embeddings:
-                missing_embeddings += 1
-            turns.append(_make_turn(user, assistant, embeddings))
+    # 2. Preserve incomplete dense turns for lexical and temporal evidence.
+    turns = [
+        _make_turn(user, assistant, embeddings)
+        for user, assistant in pairs
+    ]
+    missing_embeddings = sum(
+        user["id"] not in embeddings
+        or assistant["id"] not in embeddings
+        for user, assistant in pairs
+    )
 
     # 3. Establish one deterministic global causal order.
     turns.sort(
@@ -175,6 +258,207 @@ def _load_canonical_turns(
         )
     )
     return turns, missing_embeddings
+
+
+def _source_messages(
+    connection: sqlite3.Connection,
+) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT session_key, seq, id, role, content, extra, ts
+        FROM messages
+        ORDER BY session_key, seq
+        """
+    ).fetchall()
+
+
+def _eligible_pairs(
+    messages: list[sqlite3.Row],
+) -> list[tuple[sqlite3.Row, sqlite3.Row]]:
+    """Pair committed user/assistant messages and exclude explicit skips."""
+
+    grouped: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for message in messages:
+        grouped[str(message["session_key"])].append(message)
+    pairs = []
+    for session_messages in grouped.values():
+        for user, assistant in zip(
+            session_messages,
+            session_messages[1:],
+        ):
+            if user["role"] != "user" or assistant["role"] != "assistant":
+                continue
+            if _excluded_session(str(user["session_key"])):
+                continue
+            if _skip_post_memory(user) or _skip_post_memory(assistant):
+                continue
+            if not _message_text(user) and not _message_text(assistant):
+                continue
+            pairs.append((user, assistant))
+    return pairs
+
+
+def _excluded_session(session_key: str) -> bool:
+    return session_key.split(":", 1)[0] == "scheduler"
+
+
+def _skip_post_memory(message: sqlite3.Row) -> bool:
+    raw = message["extra"]
+    if not raw:
+        return False
+    payload = json.loads(str(raw))
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"message extra must be an object: {message['id']}"
+        )
+    return bool(payload.get("skip_post_memory"))
+
+
+def _message_text(message: sqlite3.Row) -> str:
+    return str(message["content"] or "")
+
+
+def _audit_rows(
+    connection: sqlite3.Connection,
+    pairs: list[tuple[sqlite3.Row, sqlite3.Row]],
+    config: BuildConfig,
+) -> EmbeddingAudit:
+    rows = connection.execute(
+        """
+        SELECT message_id, content_hash, embedding, dim
+        FROM message_embeddings
+        WHERE model = ?
+        ORDER BY message_id
+        """,
+        (config.embedding_model,),
+    ).fetchall()
+    embeddings = {str(row["message_id"]): row for row in rows}
+    issues, dimensions, required = _embedding_issues(
+        pairs,
+        embeddings,
+        config.embedding_dimension,
+    )
+    dimension = (
+        next(iter(dimensions))
+        if len(dimensions) == 1
+        else config.embedding_dimension
+    )
+    return EmbeddingAudit(
+        eligible_turns=len(pairs),
+        eligible_messages=required,
+        valid_messages=required - len(issues),
+        dimension=dimension,
+        issues=tuple(issues),
+    )
+
+
+def _embedding_issues(
+    pairs: list[tuple[sqlite3.Row, sqlite3.Row]],
+    embeddings: dict[str, sqlite3.Row],
+    expected_dimension: int | None,
+) -> tuple[list[EmbeddingIssue], set[int], int]:
+    """Validate identity, content, dimensions, and finite float payloads."""
+
+    issues = []
+    dimensions: set[int] = set()
+    required = 0
+    for message in (item for pair in pairs for item in pair):
+        content = _message_text(message)
+        if not content.strip():
+            continue
+        required += 1
+        issue, dimension = _embedding_issue(
+            message,
+            embeddings.get(str(message["id"])),
+            expected_dimension,
+        )
+        if issue is not None:
+            issues.append(issue)
+        elif dimension is not None:
+            dimensions.add(dimension)
+    if expected_dimension is None and len(dimensions) > 1:
+        valid_dimension = max(
+            dimensions,
+            key=lambda value: sum(
+                int(row["dim"]) == value
+                for row in embeddings.values()
+            ),
+        )
+        invalid_ids = {issue.message_id for issue in issues}
+        issues.extend(
+            _dimension_mismatches(
+                pairs,
+                embeddings,
+                valid_dimension,
+                invalid_ids,
+            )
+        )
+        dimensions = {valid_dimension}
+    issues.sort(
+        key=lambda issue: (
+            issue.session_key.encode("utf-8"),
+            issue.seq,
+            issue.message_id.encode("utf-8"),
+        )
+    )
+    return issues, dimensions, required
+
+
+def _embedding_issue(
+    message: sqlite3.Row,
+    row: sqlite3.Row | None,
+    expected_dimension: int | None,
+) -> tuple[EmbeddingIssue | None, int | None]:
+    identity = (
+        str(message["id"]),
+        str(message["session_key"]),
+        int(message["seq"]),
+        str(message["role"]),
+    )
+    if row is None:
+        return EmbeddingIssue(*identity, "missing"), None
+    content_hash = hashlib.sha256(
+        _message_text(message).encode("utf-8")
+    ).hexdigest()
+    if str(row["content_hash"]) != content_hash:
+        return EmbeddingIssue(*identity, "content_hash_mismatch"), None
+    dimension = int(row["dim"])
+    if expected_dimension is not None and dimension != expected_dimension:
+        return EmbeddingIssue(*identity, "dimension_mismatch"), None
+    vector = np.frombuffer(row["embedding"], dtype=np.float32)
+    if vector.size != dimension or not np.all(np.isfinite(vector)):
+        return EmbeddingIssue(*identity, "invalid_vector"), None
+    if float(np.linalg.norm(vector)) == 0.0:
+        return EmbeddingIssue(*identity, "zero_vector"), None
+    return None, dimension
+
+
+def _dimension_mismatches(
+    pairs: list[tuple[sqlite3.Row, sqlite3.Row]],
+    embeddings: dict[str, sqlite3.Row],
+    expected_dimension: int,
+    invalid_ids: set[str],
+) -> list[EmbeddingIssue]:
+    issues = []
+    for message in (item for pair in pairs for item in pair):
+        if not _message_text(message).strip():
+            continue
+        message_id = str(message["id"])
+        if message_id in invalid_ids:
+            continue
+        row = embeddings.get(message_id)
+        if row is None or int(row["dim"]) == expected_dimension:
+            continue
+        issues.append(
+            EmbeddingIssue(
+                message_id,
+                str(message["session_key"]),
+                int(message["seq"]),
+                str(message["role"]),
+                "dimension_mismatch",
+            )
+        )
+    return issues
 
 
 def _make_turn(
