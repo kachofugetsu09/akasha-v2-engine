@@ -124,6 +124,61 @@ class SparseIndexTest(unittest.TestCase):
             ["missing", "missing"],
         )
 
+    def test_excludes_legacy_interrupted_turn_without_embeddings(self) -> None:
+        """Treat only the exact interrupted assistant marker as non-learning."""
+
+        # 1. Preserve one legacy interrupted turn without inventing embeddings.
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with closing(sqlite3.connect(self.source)) as connection, connection:
+            connection.executemany(
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        "test:0",
+                        "test:one",
+                        0,
+                        "user",
+                        "unfinished request",
+                        None,
+                        base.isoformat(),
+                    ),
+                    (
+                        "test:1",
+                        "test:one",
+                        1,
+                        "assistant",
+                        "[interrupted]",
+                        None,
+                        (base + timedelta(seconds=5)).isoformat(),
+                    ),
+                ],
+            )
+        self._insert_turn(
+            2,
+            "completed request",
+            "answer mentions [interrupted]",
+            [1, 0],
+            [1, 0],
+        )
+
+        # 2. Audit and index only the completed turn.
+        audit = audit_source_embeddings(self.source, self._config())
+        result = build_sparse_index(self.source, self.output, self._config())
+
+        self.assertTrue(audit.complete)
+        self.assertEqual(audit.eligible_turns, 1)
+        self.assertEqual(audit.excluded_interrupted_turns, 1)
+        self.assertEqual(result.discovered_turns, 1)
+        self.assertEqual(result.excluded_interrupted_turns, 1)
+        self.assertEqual(self._scalar("SELECT COUNT(*) FROM sparse_turns"), 1)
+        self.assertEqual(
+            self._scalar(
+                "SELECT value FROM metadata "
+                "WHERE key='turns_excluded_interrupted'"
+            ),
+            "1",
+        )
+
     def _config(self) -> BuildConfig:
         return BuildConfig()
 

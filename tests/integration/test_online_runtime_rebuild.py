@@ -17,6 +17,10 @@ from akasha.infrastructure.persistence import (
     load_memory_state,
     sha256_file,
 )
+from akasha.infrastructure.sparse_index import (
+    BuildConfig,
+    audit_source_embeddings,
+)
 
 
 def test_online_commit_matches_clean_rebuild(tmp_path: Path) -> None:
@@ -122,6 +126,52 @@ def test_online_runtime_interprets_naive_host_time_like_replay(
     )
 
     assert cue.started_at == "2026-01-01T00:00:00+00:00"
+    runtime.close()
+
+
+def test_interrupted_history_matches_online_non_learning(
+    tmp_path: Path,
+) -> None:
+    """Keep a persisted interrupted marker out of online and replay state."""
+
+    # 1. Mix one completed turn with one legacy interrupted marker.
+    sessions = tmp_path / "sessions.db"
+    index = tmp_path / "index.db"
+    online_memory = tmp_path / "online-memory.db"
+    replay_memory = tmp_path / "replay-memory.db"
+    _create_sessions(sessions)
+    _append_turn(sessions, 0, "completed", [1.0, 0.0])
+    _append_interrupted_turn(sessions, 2, "unfinished")
+
+    # 2. Restore online state and rebuild from its filtered causal index.
+    config = MemoryConfig()
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=online_memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=config,
+    )
+    audit = audit_source_embeddings(
+        sessions,
+        BuildConfig(
+            embedding_model="text-embedding-v4",
+            embedding_dimension=2,
+        ),
+    )
+    rebuild_memory(index, replay_memory, target_sequences=())
+
+    assert audit.complete
+    assert audit.excluded_interrupted_turns == 1
+    assert [turn.turn_id for turn in runtime.cycle.turns] == [
+        "message:0::message:1"
+    ]
+    assert _logical_state(online_memory, index, config) == _logical_state(
+        replay_memory,
+        index,
+        config,
+    )
     runtime.close()
 
 
@@ -248,6 +298,39 @@ def _append_turn(
                     "text-embedding-v4",
                     vector.tobytes(),
                     vector.size,
+                ),
+            ],
+        )
+
+
+def _append_interrupted_turn(
+    path: Path,
+    sequence: int,
+    text: str,
+) -> None:
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    user_time = base + timedelta(minutes=sequence)
+    with sqlite3.connect(path) as connection:
+        connection.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    f"message:{sequence}",
+                    "test:one",
+                    sequence,
+                    "user",
+                    text,
+                    None,
+                    user_time.isoformat(),
+                ),
+                (
+                    f"message:{sequence + 1}",
+                    "test:one",
+                    sequence + 1,
+                    "assistant",
+                    "[interrupted]",
+                    None,
+                    (user_time + timedelta(seconds=10)).isoformat(),
                 ),
             ],
         )
