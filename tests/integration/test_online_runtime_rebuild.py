@@ -104,6 +104,46 @@ def test_online_runtime_rejects_a_second_writer(tmp_path: Path) -> None:
     replacement.close()
 
 
+def test_online_runtime_ignores_sparse_index_page_identity(
+    tmp_path: Path,
+) -> None:
+    """Restore from equal sparse evidence after SQLite page metadata changes."""
+
+    # 1. Persist one valid snapshot and change only SQLite file metadata.
+    sessions = tmp_path / "sessions.db"
+    index = tmp_path / "online-index.db"
+    memory = tmp_path / "online-memory.db"
+    _create_sessions(sessions)
+    _append_turn(sessions, 0, "alpha start", [1.0, 0.0])
+    first = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    first.close()
+    original_hash = sha256_file(index)
+    with sqlite3.connect(index) as connection:
+        connection.execute("PRAGMA user_version = 1")
+    assert sha256_file(index) != original_hash
+
+    # 2. Restore through config, count, and exact turn-message bindings.
+    replacement = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    assert [turn.turn_id for turn in replacement.cycle.turns] == [
+        "message:0::message:1"
+    ]
+    replacement.close()
+
+
 def test_online_runtime_interprets_naive_host_time_like_replay(
     tmp_path: Path,
 ) -> None:
