@@ -100,6 +100,31 @@ def test_online_runtime_rejects_a_second_writer(tmp_path: Path) -> None:
     replacement.close()
 
 
+def test_online_runtime_interprets_naive_host_time_like_replay(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "sessions.db"
+    _create_sessions(sessions)
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=tmp_path / "index.db",
+        memory_path=tmp_path / "memory.db",
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+
+    cue, _ = runtime.query_turn(
+        text="local time",
+        dense=np.asarray([1.0, 0.0], dtype=np.float32),
+        session_key="test:one",
+        timestamp=datetime(2026, 1, 1, 8),
+    )
+
+    assert cue.started_at == "2026-01-01T00:00:00+00:00"
+    runtime.close()
+
+
 def _logical_state(
     memory: Path,
     index: Path,

@@ -7,6 +7,7 @@ import math
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -303,7 +304,7 @@ def _unit_dense(vector: np.ndarray) -> np.ndarray:
 
 def _as_utc(timestamp: datetime) -> datetime:
     if timestamp.tzinfo is None:
-        raise ValueError("memory query timestamp must be timezone-aware")
+        timestamp = timestamp.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
     return timestamp.astimezone(timezone.utc)
 
 
