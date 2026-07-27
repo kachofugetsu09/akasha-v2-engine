@@ -65,6 +65,40 @@ def test_online_commit_matches_clean_rebuild(tmp_path: Path) -> None:
     online = _logical_state(online_memory, online_index, config)
     replay = _logical_state(replay_memory, online_index, config)
     assert online == replay
+    assert _table_count(online_memory, "recall_runs") == 3
+    assert _table_count(replay_memory, "recall_runs") == 3
+    assert _table_count(replay_memory, "activation_runs") == 0
+    runtime.close()
+
+
+def test_online_commit_without_ticket_persists_recall_run(
+    tmp_path: Path,
+) -> None:
+    """Recompute a missing live ticket without losing its recall audit."""
+
+    # 1. Restore one source turn, then append a second without a pending query.
+    sessions = tmp_path / "sessions.db"
+    index = tmp_path / "index.db"
+    memory = tmp_path / "memory.db"
+    _create_sessions(sessions)
+    _append_turn(sessions, 0, "alpha start", [1.0, 0.0])
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    _append_turn(sessions, 2, "alpha follows", [0.9, 0.1])
+
+    # 2. The causal fallback still evaluates and persists one recall run.
+    runtime.commit_from_source(
+        user_message_id="message:2",
+        assistant_message_id="message:3",
+        ticket=None,
+    )
+    assert _table_count(memory, "recall_runs") == 2
     runtime.close()
 
 
@@ -221,7 +255,7 @@ def _logical_state(
     config: MemoryConfig,
 ) -> dict[str, object]:
     turns = load_turns(index)
-    graph, events, evidence, context, _, burst_members = (
+    graph, events, evidence, context, recalls, burst_members = (
         load_memory_state(
             memory,
             turns=turns,
@@ -247,6 +281,7 @@ def _logical_state(
             }
             for item in evidence
         ],
+        "recalls": [asdict(item) for item in recalls],
         "context": {
             "members": context.members,
             "dense": (
@@ -258,6 +293,16 @@ def _logical_state(
         },
         "burst_members": burst_members,
     }
+
+
+def _table_count(path: Path, table: str) -> int:
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            f"SELECT COUNT(*) FROM {table}"
+        ).fetchone()
+    if row is None:
+        raise RuntimeError(f"{table} count query returned no row")
+    return int(row[0])
 
 
 def _create_sessions(path: Path) -> None:
