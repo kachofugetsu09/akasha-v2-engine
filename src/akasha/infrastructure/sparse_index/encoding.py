@@ -6,11 +6,18 @@ import json
 import hashlib
 import math
 import re
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field as dataclass_field
 from importlib.metadata import version
 
-import jieba
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message="pkg_resources is deprecated as an API.*",
+        category=UserWarning,
+    )
+    import jieba
 
 from .model import SparseFeature
 
