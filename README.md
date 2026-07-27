@@ -112,6 +112,22 @@ python scripts/check_akasic_behavior.py \
 补全中排除相同稳定 turn ID 后的结果。集合成员先按各自证据选择，再分别按
 时间从近到远展示；assistant 仅展示标准化后的前 50 字。
 
+## 只读 Inspector
+
+Akasic Agent adapter 同时声明桌面 Dashboard 和移动端 plugin UI。两端共用
+`AkashaInspectorReader`，直接从 V2 的 memory/index sidecar 重建：
+
+- 每轮 query 的 dense、BM25 与时序 seed；
+- 重放时可选保存的逐节点扩散路径；
+- 已提交的模式补全和左右脑去重结果；
+- 与运行时格式一致的 Prompt 记忆块。
+
+Inspector 以 SQLite read-only URI 和 `query_only` 打开数据库，不提供任意 SQL、
+reinforce、删除或图修改接口。普通在线轮次不一定保存逐节点 activation capture；
+这种情况下界面展示最终“补全候选”，不会把缺少诊断路径误写成没有发生扩散。
+移动端在 assistant turn 内显示本轮左右脑召回，并提供最近检索列表与按需详情。
+旧 Akasha Graph 不在 V2 接口中。
+
 ## 机制
 
 每个 turn 的 seed 是 dense、BM25、时间、累计 burst context 与 surprise 的

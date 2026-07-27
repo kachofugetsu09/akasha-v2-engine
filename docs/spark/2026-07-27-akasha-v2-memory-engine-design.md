@@ -636,7 +636,11 @@ akasha-v2-engine/
 │   ├── application/     # shared cycle、online runtime、rebuild
 │   ├── infrastructure/  # sessions/index、SQLite、writer lease
 │   ├── engine.py        # Akasic MemoryEngine adapter
-│   └── memory_plugin.py # Akasic MemoryPlugin factory
+│   ├── memory_plugin.py # Akasic MemoryPlugin factory
+│   ├── inspector.py     # read-only retrieval projection
+│   ├── dashboard.py     # desktop Inspector API
+│   ├── dashboard_panel_inspector.{ts,css}
+│   └── mobile_ui.{js,css}
 ├── scripts/             # rebuild、parity、report、contract
 └── tests/
     ├── unit/
@@ -655,9 +659,10 @@ application ─────────▶ domain
 application ports ◀── infrastructure
 ```
 
-domain 不导入 SQLite、Akasic Agent 或网络客户端。`memory_plugin.py` 和
-`engine.py` 使用相对导入，使整包以后可以作为 `plugins.akasha` 放入 host，而
-不用改写核心模块。
+domain 不导入 SQLite、Akasic Agent 或网络客户端。`memory_plugin.py`、`engine.py`
+和只读 Inspector adapter 使用相对导入，使整包以后可以作为 `plugins.akasha`
+放入 host，而不用改写核心模块。Inspector 只能读取已经提交的 sidecar；它不是第二个
+检索或学习实现。
 
 ## 16. 错误处理
 
