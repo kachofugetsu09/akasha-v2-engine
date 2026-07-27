@@ -37,7 +37,7 @@ class MemoryPlugin:
         _ = config
         plugin_dir = builtin_plugin_data_dir("akasha", workspace)
         ensure_workspace_plugin_data_dir(plugin_dir, workspace)
-        config_path = plugin_dir / "config.v2.toml"
+        config_path = plugin_dir / "config.local.toml"
         if not config_path.exists():
             atomic_write_text(
                 config_path,
@@ -69,7 +69,7 @@ class MemoryPlugin:
             deps.workspace,
         )
         akasha_config = load_akasha_config(
-            plugin_dir / "config.v2.toml"
+            plugin_dir / "config.local.toml"
         )
 
         # 2. Build the engine and expose its host lifecycle resources.
@@ -86,4 +86,3 @@ class MemoryPlugin:
             admin=engine,
             embedding_api=engine.embedding_api,
         )
-
