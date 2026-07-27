@@ -76,12 +76,19 @@ class TemporalGraphView:
     def __init__(self, graph: DynamicMemoryGraph) -> None:
         self.graph = graph
         self.max_nodes = graph.max_nodes
+        self._transition_cache: dict[
+            int,
+            tuple[tuple[tuple[int, float, int], ...], float],
+        ] = {}
 
     def transitions(
         self,
         node_id: int,
         event: int,
     ) -> tuple[tuple[tuple[int, float, int], ...], float]:
+        cached = self._transition_cache.get(node_id)
+        if cached is not None:
+            return cached
         weighted: list[tuple[int, float, int]] = []
         for edge_id in self.graph.adjacency[node_id]:
             if self.graph.kind[edge_id] not in (
@@ -100,21 +107,25 @@ class TemporalGraphView:
                 weighted.append((target, weight, edge_id))
         total = math.fsum(weight for _, weight, _ in weighted)
         if total == 0.0:
-            return (), 1.0
+            result = ((), 1.0)
+            self._transition_cache[node_id] = result
+            return result
         spread = -math.expm1(-total)
-        return (
+        result = (
             tuple(
                 (target, spread * weight / total, edge_id)
                 for target, weight, edge_id in weighted
             ),
             1.0 - spread,
         )
+        self._transition_cache[node_id] = result
+        return result
 
 
 def read_pattern_completion(
     *,
     graph: DynamicMemoryGraph,
-    turns: list[Turn],
+    pool: FeaturePool,
     query: Turn,
     context: ContextState,
     evidence: SeedEvidence,
@@ -127,7 +138,6 @@ def read_pattern_completion(
     """Read the frozen V8 basin union without mutating memory state."""
 
     # 1. Select live engram heads from current and contextual evidence.
-    pool = FeaturePool([*turns, query])
     fields = _evidence_fields(pool, query.node_id, context)
     scores = (
         fields["current"]
@@ -492,9 +502,13 @@ def _accessibility_supported_heads(
 
     if len(heads) < 2:
         return heads
+    hubs_by_event = {
+        hub.created_event: hub.node_id
+        for hub in graph.hubs
+    }
     accessibility = np.asarray(
         [
-            _head_accessibility(graph, head_id)
+            _head_accessibility(graph, head_id, hubs_by_event)
             for head_id, _, _ in heads
         ],
         dtype=np.float64,
@@ -516,15 +530,20 @@ def _accessibility_supported_heads(
 def _head_accessibility(
     graph: DynamicMemoryGraph,
     head_id: str,
+    hubs_by_event: dict[int, int] | None = None,
 ) -> float:
-    hubs_by_event = {
-        hub.created_event: hub.node_id
-        for hub in graph.hubs
-    }
+    resolved = (
+        {
+            hub.created_event: hub.node_id
+            for hub in graph.hubs
+        }
+        if hubs_by_event is None
+        else hubs_by_event
+    )
     edge_ids = tuple(
         edge_id
         for event_id in (int(value) for value in head_id.split("+"))
-        for edge_id in graph.hub_members[hubs_by_event[event_id]]
+        for edge_id in graph.hub_members[resolved[event_id]]
     )
     raw = math.fsum(graph.weight[edge_id] for edge_id in edge_ids)
     effective = math.fsum(
