@@ -163,6 +163,53 @@ def test_restart_recovers_a_staged_unpublished_suffix(
     replacement.close()
 
 
+def test_runtime_loaders_do_not_run_full_database_integrity_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Load owned sidecars without scanning every SQLite page."""
+
+    # 1. Build real sparse and memory sidecars before observing read statements.
+    sessions = tmp_path / "sessions.db"
+    index = tmp_path / "index.db"
+    memory = tmp_path / "memory.db"
+    config = MemoryConfig()
+    _create_sessions(sessions)
+    _append_turn(sessions, 0, "alpha start", [1.0, 0.0])
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=config,
+    )
+    runtime.close()
+
+    # 2. Trace real SQLite reads and reject a return to full integrity scans.
+    statements: list[str] = []
+    original_connect = sqlite3.connect
+
+    def traced_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", traced_connect)
+    turns = load_turns(index)
+    load_memory_state(
+        memory,
+        turns=turns,
+        config=config,
+        source_index_sha256=sha256_file(index),
+    )
+
+    assert not any(
+        statement.strip().upper().startswith("PRAGMA INTEGRITY_CHECK")
+        for statement in statements
+    )
+
+
 def test_online_commit_without_ticket_persists_recall_run(
     tmp_path: Path,
 ) -> None:
