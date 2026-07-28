@@ -62,7 +62,9 @@ python scripts/check_v8_parity.py \
 路径 A：启动 OnlineMemoryRuntime
         ├─ 恢复历史 prefix
         ├─ query_turn
-        └─ TurnCommitted → commit_from_source
+        └─ TurnCommitted
+             ├─ stage_from_source
+             └─ publish_staged
 
 路径 B：同一 source index
         └─ rebuild_memory
@@ -72,6 +74,7 @@ python scripts/check_v8_parity.py \
 members，而不是只比候选条数。测试同时覆盖：
 
 - 持久化 prefix 恢复后继续增长；
+- staged suffix 发布前不改变 graph snapshot，重启后能确定性补齐；
 - stale ticket 在最新 state 上重算；
 - rebuild 预分配图与在线动态扩容一致；
 - source 中缺 dense 的 turn 不被丢弃；
