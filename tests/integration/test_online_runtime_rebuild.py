@@ -71,6 +71,98 @@ def test_online_commit_matches_clean_rebuild(tmp_path: Path) -> None:
     runtime.close()
 
 
+def test_staged_commit_publishes_the_same_logical_state(
+    tmp_path: Path,
+) -> None:
+    """Keep graph state unchanged until an explicitly staged suffix publishes."""
+
+    # 1. Restore one turn and durably stage the next source pair.
+    sessions = tmp_path / "sessions.db"
+    index = tmp_path / "online-index.db"
+    memory = tmp_path / "online-memory.db"
+    replay_memory = tmp_path / "replay-memory.db"
+    _create_sessions(sessions)
+    _append_turn(sessions, 0, "alpha start", [1.0, 0.0])
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    _append_turn(sessions, 2, "alpha follows", [0.9, 0.1])
+    staged = runtime.stage_from_source(
+        user_message_id="message:2",
+        assistant_message_id="message:3",
+        ticket=None,
+    )
+
+    assert runtime.cycle.state_version == 1
+    assert _table_count(index, "sparse_turns") == 2
+    assert _table_count(memory, "turn_nodes") == 1
+
+    # 2. Publish the suffix and compare it with a clean replay.
+    runtime.publish_staged(staged)
+    rebuild_memory(index, replay_memory, target_sequences=())
+
+    assert runtime.cycle.state_version == 2
+    assert _logical_state(memory, index, MemoryConfig()) == _logical_state(
+        replay_memory,
+        index,
+        MemoryConfig(),
+    )
+    runtime.close()
+
+
+def test_restart_recovers_a_staged_unpublished_suffix(
+    tmp_path: Path,
+) -> None:
+    """Recover a durable sparse suffix after the graph publisher disappears."""
+
+    # 1. Stage one source pair and simulate exit before graph publication.
+    sessions = tmp_path / "sessions.db"
+    index = tmp_path / "online-index.db"
+    memory = tmp_path / "online-memory.db"
+    replay_memory = tmp_path / "replay-memory.db"
+    _create_sessions(sessions)
+    _append_turn(sessions, 0, "alpha start", [1.0, 0.0])
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    _append_turn(sessions, 2, "alpha follows", [0.9, 0.1])
+    runtime.stage_from_source(
+        user_message_id="message:2",
+        assistant_message_id="message:3",
+        ticket=None,
+    )
+    runtime.close()
+
+    # 2. Startup catch-up must converge to the same clean replay state.
+    replacement = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    rebuild_memory(index, replay_memory, target_sequences=())
+
+    assert replacement.cycle.state_version == 2
+    assert _logical_state(memory, index, MemoryConfig()) == _logical_state(
+        replay_memory,
+        index,
+        MemoryConfig(),
+    )
+    replacement.close()
+
+
 def test_online_commit_without_ticket_persists_recall_run(
     tmp_path: Path,
 ) -> None:

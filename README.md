@@ -78,7 +78,9 @@ python scripts/export_recall_report.py \
 `MemoryPlugin.plugin_id` 保持为 `akasha`，并实现 Akasic Agent 当前的
 `MemoryPlugin`/`MemoryEngine` protocol。宿主在 query 阶段得到非变异的
 `RetrievalTicket`；持久化 `TurnCommitted` 到达后，adapter 从真实消息 ID
-读取 turn、补齐 embedding，并调用同一个 cycle 完成学习和原子落库。
+读取 turn、补齐 embedding，并先把因果 suffix 持久化到 sparse index。
+`TurnCommitted` 随后即可返回；单写者后台任务调用同一个 cycle 完成学习和
+原子落库。下一次 query 会等待该任务完成，因此不会读取落后的图状态。
 自动 `context` 查询是唯一会保留 ticket 的读取入口；显式
 `recall_memory` 即使由宿主标记为 stateful，也按只读执行，不会覆盖本轮自动
 上下文或生成图学习。
@@ -89,14 +91,19 @@ MemoryEngine.query
        └─ MemoryCycle.retrieve
 
 TurnCommitted
-  └─ OnlineMemoryRuntime.commit_from_source
+  ├─ OnlineMemoryRuntime.stage_from_source
+  │    └─ durable sparse-index suffix
+  └─ background publish_staged
        └─ MemoryCycle.commit
             └─ atomic SQLite snapshot
+
+next MemoryEngine.query
+  └─ publication fence
 ```
 
 同一 sidecar 具有单写者 lease。第二个进程指向同一路径时启动失败，避免两个
 图状态相互覆盖。进程崩溃后，下一次启动会从 `sessions.db` 增量补齐 sidecar
-尚未提交的 turns。
+尚未提交的 turns；已经 staged 但尚未 publish 的 suffix 使用同一恢复路径。
 
 adapter 契约可以对当前 Akasic Agent checkout 做结构检查：
 
