@@ -17,6 +17,12 @@ from akasha.domain.features import (
 )
 from akasha.domain.graph import MEMBERSHIP, DynamicMemoryGraph
 from akasha.domain.model import MemoryConfig, SeedEvidence, Turn
+from akasha.domain.readout import (
+    PatternCompletion,
+    RecallItem,
+    _competitive_route_union,
+    _independent_address_mass,
+)
 
 
 def test_indexed_heap_has_one_entry_and_stable_ties() -> None:
@@ -38,6 +44,33 @@ def test_absent_evidence_does_not_activate_every_historical_turn() -> None:
     logits = np.zeros(4_347, dtype=np.float64)
 
     assert _sparsemax(logits) == ()
+
+
+def test_context_dependence_selects_independent_address_route() -> None:
+    assert _independent_address_mass(0.0) == 1.0
+    assert _independent_address_mass(0.1) == 1.0
+    assert _independent_address_mass(0.5) == pytest.approx(0.5)
+    assert _independent_address_mass(0.9) == 0.0
+    assert _independent_address_mass(1.0) == 0.0
+
+
+def test_competitive_route_union_preserves_baseline_and_rejects_weak_tail() -> None:
+    semantic = _completion(
+        RecallItem(0, 0.01, ("sharp_completion",), ()),
+        RecallItem(1, 1.0, ("basin_completion",), ("base",)),
+    )
+    address = _completion(
+        RecallItem(2, 0.8, ("basin_completion",), ("address",)),
+        RecallItem(3, 0.01, ("basin_completion",), ("address",)),
+        RecallItem(4, 0.9, ("basin_direct",), ("address",)),
+    )
+
+    merged = _competitive_route_union(semantic, address, 1.0)
+
+    assert tuple(item.node_id for item in merged.items) == (1, 2, 0)
+    assert {item.node_id for item in semantic.items} <= {
+        item.node_id for item in merged.items
+    }
 
 
 def test_residual_push_is_a_fixed_point_lower_bound() -> None:
@@ -417,6 +450,27 @@ def test_rebuild_database_is_independent_of_python_hash_seed(tmp_path: Path) -> 
         hashes.append(hashlib.sha256(output.read_bytes()).hexdigest())
 
     assert len(set(hashes)) == 1
+
+
+def _completion(*items: RecallItem) -> PatternCompletion:
+    return PatternCompletion(
+        items=items,
+        active_basin_count=1,
+        sharp_completion_count=sum(
+            "sharp_completion" in item.sources for item in items
+        ),
+        basin_direct_count=sum(
+            "basin_direct" in item.sources for item in items
+        ),
+        basin_completion_count=sum(
+            "basin_completion" in item.sources for item in items
+        ),
+        relative_tail_count=sum(
+            "relative_tail" in item.sources for item in items
+        ),
+        pushes=1,
+        residual_l1=0.0,
+    )
 
 
 def _transition_matrix(
