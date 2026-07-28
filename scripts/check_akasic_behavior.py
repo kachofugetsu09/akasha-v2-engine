@@ -116,6 +116,8 @@ async def _verify() -> None:
     engine._runtime = _Runtime(turns)  # noqa: SLF001
     engine._config = AkashaConfig()  # noqa: SLF001
     engine._lock = threading.RLock()  # noqa: SLF001
+    engine._commit_gate = asyncio.Lock()  # noqa: SLF001
+    engine._publish_task = None  # noqa: SLF001
     engine._pending = {}  # noqa: SLF001
     timestamp = datetime(2026, 7, 27, tzinfo=timezone.utc)
 
