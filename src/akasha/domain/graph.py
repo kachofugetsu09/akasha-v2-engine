@@ -335,7 +335,7 @@ class DynamicMemoryGraph:
         """Remove suppressed turns from independent plasticity support."""
 
         for node_id in inhibited_nodes:
-            self.current_external.pop(node_id, None)
+            _ = self.current_external.pop(node_id, None)
 
     def reinforce_feedback_nodes(
         self,
@@ -355,8 +355,8 @@ class DynamicMemoryGraph:
         }
         gain = boost ** self.config.learning_rate
         credit = math.log(gain)
-        affected_hubs = set()
-        affected_sources = set()
+        affected_hubs: set[int] = set()
+        affected_sources: set[int] = set()
         self._transition_cache.clear()
 
         # 2. Potentiate the target membership without creating neighbor relations.
@@ -385,9 +385,9 @@ class DynamicMemoryGraph:
 
         # 3. Preserve the existing per-episode and per-source conductance budgets.
         for hub_node in sorted(affected_hubs):
-            self._normalize_hub(hub_node)
+            _ = self._normalize_hub(hub_node)
         for source in sorted(affected_sources):
-            self._normalize_membership_source(source)
+            _ = self._normalize_membership_source(source)
 
     def learn(
         self,
