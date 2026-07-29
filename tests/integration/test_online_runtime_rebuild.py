@@ -151,7 +151,7 @@ def test_message_feedback_matches_online_restore_and_clean_rebuild(
         (2, "remember", 1, 3.0),
     ]
 
-    # 3. A future cue cannot seed, traverse through, or read out the old turn.
+    # 3. A future cue may use the old turn as a hidden bridge but cannot emit it.
     query, future = runtime.query_turn(
         text="old claim",
         dense=np.asarray([1.0, 0.0], dtype=np.float32),
@@ -159,8 +159,8 @@ def test_message_feedback_matches_online_restore_and_clean_rebuild(
         timestamp=started + timedelta(minutes=2),
     )
     assert query.node_id == 3
-    assert 0 not in dict(future.evidence.seed)
-    assert float(future.diffusion.reserve[0]) == 0.0
+    assert 0 in dict(future.evidence.seed)
+    assert float(future.diffusion.reserve[0]) > 0.0
     assert 0 not in {
         item.node_id for item in future.completion.items
     }

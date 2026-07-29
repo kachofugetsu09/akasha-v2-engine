@@ -12,6 +12,7 @@ from .model import DiffusionResult, MemoryConfig, PlasticityResult, SeedEvidence
 MEMBERSHIP = 0
 TEMPORAL_FORWARD = 1
 TEMPORAL_BACKWARD = 2
+FEEDBACK_EDGE_FRACTION = 0.6
 
 
 @dataclass(frozen=True)
@@ -328,42 +329,80 @@ class DynamicMemoryGraph:
         self._transition_cache[node_id] = result
         return result
 
-    def apply_feedback_external(
+    def apply_feedback_inhibition(
         self,
-        *,
         inhibited_nodes: frozenset[int],
-        explicit_nodes: dict[int, float],
     ) -> None:
-        """Update commit-time eligibility after Message feedback becomes durable."""
+        """Remove suppressed turns from independent plasticity support."""
 
-        # 1. Prevent inhibited turns from receiving independent support.
         for node_id in inhibited_nodes:
             self.current_external.pop(node_id, None)
 
-        # 2. Register newly explicit reactivation once at the current event time.
-        for node_id in sorted(explicit_nodes):
-            credit = explicit_nodes[node_id]
-            if (
-                node_id in inhibited_nodes
-                or node_id == self.current_event
-                or credit <= 0.0
-            ):
-                continue
-            previous_credit = self.current_external.get(node_id, 0.0)
-            if previous_credit == 0.0:
-                previous = self.last_external_seed_seconds.get(node_id)
-                if previous is not None:
-                    self._observe_recurrence(
-                        self.elapsed_seconds - previous,
-                        credit,
-                    )
-                self.last_external_seed_seconds[node_id] = (
-                    self.elapsed_seconds
+    def reinforce_feedback_nodes(
+        self,
+        node_ids: tuple[int, ...],
+        boost: float,
+    ) -> None:
+        """Strengthen each target's self-edge inside its own episode."""
+
+        if boost == 1.0:
+            return
+
+        # 1. Resolve only the episode created by the addressed turn itself.
+        own_hubs = {
+            hub.created_event: hub
+            for hub in self.hubs
+            if hub.created_event in node_ids
+        }
+        gain = 1.0 + FEEDBACK_EDGE_FRACTION * (boost - 1.0)
+        credit = math.log(gain)
+        affected_hubs = set()
+        affected_sources = set()
+        self._transition_cache.clear()
+
+        # 2. Potentiate the target membership without creating neighbor relations.
+        for node_id in sorted(node_ids):
+            own_hub = own_hubs.get(node_id)
+            edge_id = (
+                next(
+                    (
+                        edge
+                        for edge in own_hub.member_edge_ids
+                        if self.source[edge] == node_id
+                    ),
+                    None,
                 )
-            self.current_external[node_id] = max(
-                previous_credit,
-                credit,
+                if own_hub is not None
+                else None
             )
+            candidates = (
+                edge
+                for edge in self.adjacency[node_id]
+                if self.kind[edge] == MEMBERSHIP
+                if self.source[edge] == node_id
+            )
+            if edge_id is None:
+                edge_id = max(
+                    candidates,
+                    key=lambda edge: (self.weight[edge], -edge),
+                    default=None,
+                )
+                if edge_id is None:
+                    continue
+            self.weight[edge_id] = min(
+                1.0,
+                self.weight[edge_id] * gain,
+            )
+            self.last_updated[edge_id] = self.current_event
+            self._support_edge(edge_id, credit, credit)
+            affected_hubs.add(self.target[edge_id])
+            affected_sources.add(node_id)
+
+        # 3. Preserve the existing per-episode and per-source conductance budgets.
+        for hub_node in sorted(affected_hubs):
+            self._normalize_hub(hub_node)
+        for source in sorted(affected_sources):
+            self._normalize_membership_source(source)
 
     def learn(
         self,

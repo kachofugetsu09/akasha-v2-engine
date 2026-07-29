@@ -9,6 +9,7 @@ import pytest
 import akasha.application.cycle as cycle_module
 from akasha.application.cycle import MemoryCycle
 from akasha.domain.features import BurstAwareFeaturePool
+from akasha.domain.graph import MEMBERSHIP
 from akasha.domain.model import MemoryConfig, Turn, TurnFeedback
 from akasha.infrastructure.persistence import (
     load_memory_state,
@@ -152,10 +153,11 @@ def test_preallocated_rebuild_matches_incremental_online_growth() -> None:
     assert _cycle_state(replay) == _cycle_state(online)
 
 
-def test_feedback_replay_masks_forget_and_binds_remember_locally() -> None:
-    """Apply both feedback primitives at commit and hide forgotten traversal."""
+def test_feedback_replay_hides_forget_and_reinforces_one_self_edge() -> None:
+    """Keep forgotten turns as bridges and potentiate only the target episode."""
 
     turns = [_turn(index) for index in range(4)]
+    neutral = _replay(turns[:3], MemoryConfig())
     turns[2] = replace(
         turns[2],
         feedback=TurnFeedback(
@@ -168,16 +170,43 @@ def test_feedback_replay_masks_forget_and_binds_remember_locally() -> None:
 
     marker_evidence = cycle.evidence[2]
     assert cycle.inhibited_nodes == {0}
-    assert 0 not in dict(marker_evidence.seed)
-    assert marker_evidence.channels["explicit_reinforce"] == frozenset({1})
-    assert dict(marker_evidence.seed)[1] >= 2.0 / 3.0
+    assert marker_evidence == neutral.evidence[2]
+    neutral_edges = [
+        edge
+        for edge in neutral.graph.adjacency[1]
+        if neutral.graph.kind[edge] == MEMBERSHIP
+        and neutral.graph.source[edge] == 1
+    ]
+    target_edge = max(
+        neutral_edges,
+        key=lambda edge: (neutral.graph.weight[edge], -edge),
+    )
+    changed_edges = [
+        edge
+        for edge, (before, after) in enumerate(
+            zip(
+                neutral.graph.weight,
+                cycle.graph.weight,
+                strict=True,
+            )
+        )
+        if not np.isclose(before, after)
+    ]
+    assert changed_edges == [target_edge]
+    assert cycle.graph.weight[target_edge] > neutral.graph.weight[target_edge]
 
-    ticket = cycle.retrieve(turns[3], capture_paths=True)
-    assert 0 not in dict(ticket.evidence.seed)
+    old_cue = replace(
+        turns[3],
+        user_text=turns[0].user_text,
+        user_dense=turns[0].user_dense,
+        user_terms=turns[0].user_terms,
+    )
+    ticket = cycle.retrieve(old_cue, capture_paths=True)
+    assert 0 in dict(ticket.evidence.seed)
     assert 0 not in {
         item.node_id for item in ticket.completion.items
     }
-    assert float(ticket.diffusion.reserve[0]) == 0.0
+    assert float(ticket.diffusion.reserve[0]) > 0.0
 
 
 def test_feedback_online_growth_matches_preallocated_replay() -> None:

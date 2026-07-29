@@ -117,8 +117,10 @@ adapter 已按真实 Akasic Agent checkout 验证：
 ```
 
 `MemoryPlugin` 暴露 engine、admin、embedding API 和 closeables。查询阶段不
-改变图；`TurnCommitted` 是唯一事实写入入口。手工 remember、forget 和外部
-reinforce 不参与无监督学习。
+改变图；`TurnCommitted` 是唯一事实写入入口。手工 admin remember、forget
+和外部 reinforce 不参与无监督学习。随已提交 turn 持久化的 Message feedback
+是例外：remember 只增强目标 turn 在自身 episode 中的 membership，forget
+保留目标作为联想传播桥，但从最终召回结果和后续独立可塑性支持中隐藏。
 
 ## 测试边界
 
