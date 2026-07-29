@@ -22,6 +22,39 @@ class TransitionGraph(Protocol):
     ) -> tuple[tuple[tuple[int, float, int], ...], float]: ...
 
 
+class InhibitedGraphView:
+    """Block selected turn coordinates without renormalizing surviving edges."""
+
+    def __init__(
+        self,
+        graph: TransitionGraph,
+        inhibited_nodes: frozenset[int],
+    ) -> None:
+        self.graph = graph
+        self.inhibited_nodes = inhibited_nodes
+        self.max_nodes = graph.max_nodes
+
+    def transitions(
+        self,
+        node_id: int,
+        event: int,
+    ) -> tuple[tuple[tuple[int, float, int], ...], float]:
+        if node_id in self.inhibited_nodes:
+            return (), 1.0
+        transitions, unspread = self.graph.transitions(node_id, event)
+        visible = tuple(
+            item
+            for item in transitions
+            if item[0] not in self.inhibited_nodes
+        )
+        blocked_mass = math.fsum(
+            probability
+            for target, probability, _ in transitions
+            if target in self.inhibited_nodes
+        )
+        return visible, unspread + blocked_mass
+
+
 class IndexedMaxHeap:
     """Keep at most one residual entry per node with stable tie-breaking."""
 

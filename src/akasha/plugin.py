@@ -10,7 +10,7 @@ from agent.plugins import (
 from agent.plugins.mobile_ui import MobileUiRpcInvalidRequest
 from core.memory.engine import MemoryRecord
 
-from .engine import AkashaMemoryEngine
+from .engine import AkashaFeedbackPersistModule, AkashaMemoryEngine
 from .inspector import AkashaInspectorReader, mobile_summary
 from .memory_plugin import MemoryPlugin
 
@@ -28,6 +28,9 @@ class AkashaPlugin(Plugin):
 
     def __init__(self) -> None:
         self._reader: AkashaInspectorReader | None = None
+
+    def after_reasoning_modules(self) -> list[object]:
+        return [AkashaFeedbackPersistModule(self)]
 
     @classmethod
     def dashboard_module(cls) -> str:

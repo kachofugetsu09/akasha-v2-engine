@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +9,7 @@ import pytest
 import akasha.application.cycle as cycle_module
 from akasha.application.cycle import MemoryCycle
 from akasha.domain.features import BurstAwareFeaturePool
-from akasha.domain.model import MemoryConfig, Turn
+from akasha.domain.model import MemoryConfig, Turn, TurnFeedback
 from akasha.infrastructure.persistence import (
     load_memory_state,
     write_memory_database,
@@ -152,23 +152,79 @@ def test_preallocated_rebuild_matches_incremental_online_growth() -> None:
     assert _cycle_state(replay) == _cycle_state(online)
 
 
+def test_feedback_replay_masks_forget_and_binds_remember_locally() -> None:
+    """Apply both feedback primitives at commit and hide forgotten traversal."""
+
+    turns = [_turn(index) for index in range(4)]
+    turns[2] = replace(
+        turns[2],
+        feedback=TurnFeedback(
+            remember_nodes=(1,),
+            forget_nodes=(0,),
+            remember_boost=3.0,
+        ),
+    )
+    cycle = _replay(turns[:3], MemoryConfig())
+
+    marker_evidence = cycle.evidence[2]
+    assert cycle.inhibited_nodes == {0}
+    assert 0 not in dict(marker_evidence.seed)
+    assert marker_evidence.channels["explicit_reinforce"] == frozenset({1})
+    assert dict(marker_evidence.seed)[1] >= 2.0 / 3.0
+
+    ticket = cycle.retrieve(turns[3], capture_paths=True)
+    assert 0 not in dict(ticket.evidence.seed)
+    assert 0 not in {
+        item.node_id for item in ticket.completion.items
+    }
+    assert float(ticket.diffusion.reserve[0]) == 0.0
+
+
+def test_feedback_online_growth_matches_preallocated_replay() -> None:
+    turns = [_turn(index) for index in range(10)]
+    turns[6] = replace(
+        turns[6],
+        feedback=TurnFeedback(
+            remember_nodes=(5,),
+            forget_nodes=(1,),
+            remember_boost=3.0,
+        ),
+    )
+    config = MemoryConfig()
+    online = _replay(turns, config)
+    replay = MemoryCycle(
+        config,
+        turn_capacity=len(turns),
+        feature_pool=BurstAwareFeaturePool(turns),
+    )
+
+    for turn in turns:
+        replay.commit(
+            turn,
+            replay.retrieve(
+                turn,
+                capture_paths=True,
+                isolate_graph=False,
+            ),
+        )
+
+    assert _cycle_state(replay) == _cycle_state(online)
+    assert replay.inhibited_nodes == {1}
+
+
 def test_turn_without_dense_still_joins_lexical_temporal_memory() -> None:
     turns = [_turn(index) for index in range(3)]
-    unrelated = Turn(
-        **{
-            **asdict(turns[1]),
-            "user_text": "unrelated omega",
-            "assistant_text": "unrelated answer",
-            "user_terms": (("unrelated", 1), ("omega", 1)),
-            "assistant_terms": (("unrelated", 1), ("answer", 1)),
-        }
+    unrelated = replace(
+        turns[1],
+        user_text="unrelated omega",
+        assistant_text="unrelated answer",
+        user_terms=(("unrelated", 1), ("omega", 1)),
+        assistant_terms=(("unrelated", 1), ("answer", 1)),
     )
-    missing_dense = Turn(
-        **{
-            **asdict(turns[2]),
-            "user_dense": None,
-            "assistant_dense": None,
-        }
+    missing_dense = replace(
+        turns[2],
+        user_dense=None,
+        assistant_dense=None,
     )
     cycle = _replay(
         [turns[0], unrelated, missing_dense],
@@ -236,6 +292,7 @@ def _cycle_state(cycle: MemoryCycle) -> dict[str, object]:
             graph.recurrence_weight,
         ),
         "last_external": dict(graph.last_external_seed_seconds),
+        "inhibited_nodes": sorted(cycle.inhibited_nodes),
     }
 
 

@@ -526,7 +526,10 @@ def _write_sparse_fixture(path: Path) -> None:
                 started_at TEXT NOT NULL,
                 committed_at TEXT NOT NULL,
                 user_text TEXT NOT NULL,
-                assistant_text TEXT NOT NULL
+                assistant_text TEXT NOT NULL,
+                remember_targets_json TEXT NOT NULL,
+                forget_targets_json TEXT NOT NULL,
+                remember_boost REAL NOT NULL
             );
             CREATE TABLE turn_dense (
                 turn_id TEXT NOT NULL,
@@ -546,14 +549,17 @@ def _write_sparse_fixture(path: Path) -> None:
             "INSERT INTO metadata VALUES (?, ?)",
             [
                 ("embedding_model", "fixture"),
-                ("index_version", "fixture"),
+                ("index_version", "8"),
                 ("turns_missing_embeddings", "0"),
             ],
         )
         for index in range(4):
             turn_id = f"s:{index}::s:{index + 1}"
             connection.execute(
-                "INSERT INTO sparse_turns VALUES (?, 's', ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO sparse_turns
+                VALUES (?, 's', ?, ?, ?, ?, ?, ?, ?, '[]', '[]', 1.0)
+                """,
                 (
                     turn_id,
                     index * 2,

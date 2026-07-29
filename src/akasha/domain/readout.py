@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .diffusion import residual_push
+from .diffusion import InhibitedGraphView, residual_push
 from .features import (
     FeaturePool,
     _sparsemax,
@@ -135,6 +135,7 @@ def read_pattern_completion(
     context_dependence: float,
     visible_nodes: tuple[int, ...] = (),
     burst_continued: bool = True,
+    inhibited_nodes: frozenset[int] = frozenset(),
 ) -> PatternCompletion:
     """Read contextual and independent basin routes without mutating memory."""
 
@@ -150,6 +151,7 @@ def read_pattern_completion(
         config=config,
         visible_nodes=visible_nodes,
         burst_continued=burst_continued,
+        inhibited_nodes=inhibited_nodes,
     )
 
     # 2. Inhibit query-only routing when the cue depends on its active context.
@@ -164,6 +166,7 @@ def read_pattern_completion(
         historical_surprise=historical_surprise,
         config=config,
         visible_nodes=visible_nodes,
+        inhibited_nodes=inhibited_nodes,
     )
 
     # 3. Let address-only completions compete without evicting baseline items.
@@ -186,10 +189,16 @@ def _read_contextual_route(
     config: MemoryConfig,
     visible_nodes: tuple[int, ...],
     burst_continued: bool,
+    inhibited_nodes: frozenset[int],
 ) -> PatternCompletion:
     """Settle the existing current-cue plus active-context route."""
 
-    fields = _evidence_fields(pool, query.node_id, context)
+    fields = _evidence_fields(
+        pool,
+        query.node_id,
+        context,
+        inhibited_nodes,
+    )
     scores = (
         fields["current"]
         + evidence.continuation
@@ -207,6 +216,7 @@ def _read_contextual_route(
         config=config,
         visible_nodes=visible_nodes,
         burst_continued=burst_continued,
+        inhibited_nodes=inhibited_nodes,
     )
 
 
@@ -219,6 +229,7 @@ def _read_independent_route(
     historical_surprise: np.ndarray,
     config: MemoryConfig,
     visible_nodes: tuple[int, ...],
+    inhibited_nodes: frozenset[int],
 ) -> PatternCompletion:
     """Settle a query-only graph-address route without active context."""
 
@@ -226,10 +237,11 @@ def _read_independent_route(
         pool,
         query.node_id,
         ContextState((), None, ()),
+        inhibited_nodes,
     )
     seed = _sparsemax(fields["current"])
     diffusion = residual_push(
-        graph,
+        InhibitedGraphView(graph, inhibited_nodes),
         seed,
         query.node_id,
         restart=config.restart,
@@ -248,6 +260,7 @@ def _read_independent_route(
         config=config,
         visible_nodes=visible_nodes,
         burst_continued=False,
+        inhibited_nodes=inhibited_nodes,
     )
 
 
@@ -264,11 +277,17 @@ def _read_route(
     config: MemoryConfig,
     visible_nodes: tuple[int, ...],
     burst_continued: bool,
+    inhibited_nodes: frozenset[int],
 ) -> PatternCompletion:
     """Settle one independently normalized basin-routing hypothesis."""
 
     # 1. Select live engram heads from this route's evidence.
-    basins = _active_basins(graph, query.node_id, basin_scores)
+    basins = _active_basins(
+        graph,
+        query.node_id,
+        basin_scores,
+        inhibited_nodes,
+    )
     temperature = _surprise_temperature(
         surprise,
         historical_surprise,
@@ -283,6 +302,7 @@ def _read_route(
             continuation,
             temperature,
         ),
+        inhibited_nodes,
     )
     return _materialize_route_completion(
         graph=graph,
@@ -293,6 +313,7 @@ def _read_route(
         continuation=continuation,
         config=config,
         visible_nodes=visible_nodes,
+        inhibited_nodes=inhibited_nodes,
     )
 
 
@@ -306,6 +327,7 @@ def _materialize_route_completion(
     continuation: float,
     config: MemoryConfig,
     visible_nodes: tuple[int, ...],
+    inhibited_nodes: frozenset[int],
 ) -> PatternCompletion:
     """Diffuse selected heads and expose one route's stable readout."""
 
@@ -318,10 +340,11 @@ def _materialize_route_completion(
         heads=heads,
         continuation=continuation,
         config=config,
+        inhibited_nodes=inhibited_nodes,
     )
 
     # 2. Produce a stable set-valued readout with source provenance.
-    visible = set(visible_nodes)
+    visible = set(visible_nodes) | set(inhibited_nodes)
     items = tuple(
         item
         for item in _recall_items(
@@ -505,6 +528,7 @@ def _diffuse_heads(
     heads: list[tuple[str, float, tuple[tuple[int, float], ...]]],
     continuation: float,
     config: MemoryConfig,
+    inhibited_nodes: frozenset[int],
 ) -> _CompletionComponents:
     """Diffuse selected basins and retain the V8 local entmax tail."""
 
@@ -523,10 +547,14 @@ def _diffuse_heads(
     basin_mass: dict[int, float] = {}
     tail_mass: dict[int, float] = {}
     basin_ids: dict[int, set[str]] = {}
-    temporal = TemporalGraphView(graph)
+    inhibited_graph = InhibitedGraphView(graph, inhibited_nodes)
+    temporal = InhibitedGraphView(
+        TemporalGraphView(graph),
+        inhibited_nodes,
+    )
     for head_id, mass, seed in heads:
         _diffuse_one_head(
-            graph=graph,
+            graph=inhibited_graph,
             temporal=temporal,
             query=query,
             head_id=head_id,
@@ -559,8 +587,8 @@ def _diffuse_heads(
 
 def _diffuse_one_head(
     *,
-    graph: DynamicMemoryGraph,
-    temporal: TemporalGraphView,
+    graph: InhibitedGraphView,
+    temporal: InhibitedGraphView,
     query: Turn,
     head_id: str,
     head_mass: float,
@@ -673,6 +701,7 @@ def _evidence_fields(
     pool: FeaturePool,
     index: int,
     context: ContextState,
+    inhibited_nodes: frozenset[int],
 ) -> dict[str, np.ndarray]:
     """Return calibrated current-cue and prior-context evidence fields."""
 
@@ -698,6 +727,15 @@ def _evidence_fields(
     context_bm25 = _tail_surprisal(
         pool.bm25_scores(dict(context.terms), index)
     )
+    for values in (
+        current_dense,
+        current_bm25,
+        context_dense,
+        context_bm25,
+    ):
+        for node_id in inhibited_nodes:
+            if node_id < values.size:
+                values[node_id] = 0.0
     current = current_dense + current_bm25
     same_event = current + context_dense + context_bm25
     return {
@@ -714,6 +752,7 @@ def _active_basins(
     graph: DynamicMemoryGraph,
     event: int,
     scores: np.ndarray,
+    inhibited_nodes: frozenset[int],
 ) -> tuple[Basin, ...]:
     """Match cues to raw engram structure before decayed transmission."""
 
@@ -724,7 +763,11 @@ def _active_basins(
         for edge_id in hub.member_edge_ids:
             node_id = graph.source[edge_id]
             weight = graph.weight[edge_id]
-            if node_id < event and weight > 0.0:
+            if (
+                node_id < event
+                and node_id not in inhibited_nodes
+                and weight > 0.0
+            ):
                 members.append(node_id)
                 weights.append(weight)
         if len(members) < 2:
@@ -779,6 +822,7 @@ def _pooled_heads(
 def _accessibility_supported_heads(
     graph: DynamicMemoryGraph,
     heads: list[tuple[str, float, tuple[tuple[int, float], ...]]],
+    inhibited_nodes: frozenset[int],
 ) -> list[tuple[str, float, tuple[tuple[int, float], ...]]]:
     """Intersect selected heads with relative live conductance support."""
 
@@ -790,7 +834,12 @@ def _accessibility_supported_heads(
     }
     accessibility = np.asarray(
         [
-            _head_accessibility(graph, head_id, hubs_by_event)
+            _head_accessibility(
+                graph,
+                head_id,
+                hubs_by_event,
+                inhibited_nodes,
+            )
             for head_id, _, _ in heads
         ],
         dtype=np.float64,
@@ -813,6 +862,7 @@ def _head_accessibility(
     graph: DynamicMemoryGraph,
     head_id: str,
     hubs_by_event: dict[int, int] | None = None,
+    inhibited_nodes: frozenset[int] = frozenset(),
 ) -> float:
     resolved = (
         {
@@ -826,6 +876,7 @@ def _head_accessibility(
         edge_id
         for event_id in (int(value) for value in head_id.split("+"))
         for edge_id in graph.hub_members[resolved[event_id]]
+        if graph.source[edge_id] not in inhibited_nodes
     )
     raw = math.fsum(graph.weight[edge_id] for edge_id in edge_ids)
     effective = math.fsum(

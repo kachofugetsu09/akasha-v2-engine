@@ -328,6 +328,43 @@ class DynamicMemoryGraph:
         self._transition_cache[node_id] = result
         return result
 
+    def apply_feedback_external(
+        self,
+        *,
+        inhibited_nodes: frozenset[int],
+        explicit_nodes: dict[int, float],
+    ) -> None:
+        """Update commit-time eligibility after Message feedback becomes durable."""
+
+        # 1. Prevent inhibited turns from receiving independent support.
+        for node_id in inhibited_nodes:
+            self.current_external.pop(node_id, None)
+
+        # 2. Register newly explicit reactivation once at the current event time.
+        for node_id in sorted(explicit_nodes):
+            credit = explicit_nodes[node_id]
+            if (
+                node_id in inhibited_nodes
+                or node_id == self.current_event
+                or credit <= 0.0
+            ):
+                continue
+            previous_credit = self.current_external.get(node_id, 0.0)
+            if previous_credit == 0.0:
+                previous = self.last_external_seed_seconds.get(node_id)
+                if previous is not None:
+                    self._observe_recurrence(
+                        self.elapsed_seconds - previous,
+                        credit,
+                    )
+                self.last_external_seed_seconds[node_id] = (
+                    self.elapsed_seconds
+                )
+            self.current_external[node_id] = max(
+                previous_credit,
+                credit,
+            )
+
     def learn(
         self,
         event: int,
