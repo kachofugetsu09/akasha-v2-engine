@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import akasha.application.runtime as runtime_module
 from akasha.application.rebuild import rebuild_memory
 from akasha.application.runtime import OnlineMemoryRuntime
 from akasha.domain.model import MemoryConfig
@@ -112,6 +114,97 @@ def test_staged_commit_publishes_the_same_logical_state(
         index,
         MemoryConfig(),
     )
+    runtime.close()
+
+
+def test_failed_publication_restores_the_durable_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollback mutated in-memory state from the durable database truth."""
+
+    # 1. Stage a real suffix from a published one-turn prefix.
+    sessions = tmp_path / "sessions.db"
+    index = tmp_path / "online-index.db"
+    memory = tmp_path / "online-memory.db"
+    _create_sessions(sessions)
+    _append_turn(sessions, 0, "alpha start", [1.0, 0.0])
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    durable_hash = sha256_file(memory)
+    _append_turn(sessions, 2, "alpha follows", [0.9, 0.1])
+    staged = runtime.stage_from_source(
+        user_message_id="message:2",
+        assistant_message_id="message:3",
+        ticket=None,
+    )
+
+    # 2. Fail the durable boundary after learning mutated the live cache.
+    def fail_write(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        raise OSError("injected snapshot failure")
+
+    monkeypatch.setattr(runtime_module, "write_memory_database", fail_write)
+    with pytest.raises(OSError, match="injected snapshot failure"):
+        runtime.publish_staged(staged)
+
+    assert runtime.cycle.state_version == 1
+    assert runtime.cycle.graph.current_event == 0
+    assert [turn.turn_id for turn in runtime.cycle.turns] == [
+        "message:0::message:1"
+    ]
+    assert sha256_file(memory) == durable_hash
+
+    # 3. The same staged write can retry from the restored version.
+    monkeypatch.undo()
+    runtime.publish_staged(staged)
+    assert runtime.cycle.state_version == 2
+    runtime.close()
+
+
+def test_first_publication_failure_restores_an_empty_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollback the first turn when no durable memory database exists yet."""
+
+    sessions = tmp_path / "sessions.db"
+    index = tmp_path / "online-index.db"
+    memory = tmp_path / "online-memory.db"
+    _create_sessions(sessions)
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    _append_turn(sessions, 0, "alpha start", [1.0, 0.0])
+    staged = runtime.stage_from_source(
+        user_message_id="message:0",
+        assistant_message_id="message:1",
+        ticket=None,
+    )
+
+    def fail_write(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        raise OSError("injected first snapshot failure")
+
+    monkeypatch.setattr(runtime_module, "write_memory_database", fail_write)
+    with pytest.raises(OSError, match="injected first snapshot failure"):
+        runtime.publish_staged(staged)
+
+    assert runtime.cycle.state_version == 0
+    assert runtime.cycle.graph.current_event == -1
+    assert not runtime.cycle.turns
+    assert not memory.exists()
     runtime.close()
 
 
@@ -339,6 +432,49 @@ def test_online_runtime_interprets_naive_host_time_like_replay(
     )
 
     assert cue.started_at == "2026-01-01T00:00:00+00:00"
+    runtime.close()
+
+
+def test_concurrent_queries_share_one_unchanged_published_graph(
+    tmp_path: Path,
+) -> None:
+    """Serialize reversible previews inside the runtime state owner."""
+
+    sessions = tmp_path / "sessions.db"
+    _create_sessions(sessions)
+    _append_turn(sessions, 0, "alpha start", [1.0, 0.0])
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=tmp_path / "index.db",
+        memory_path=tmp_path / "memory.db",
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    published_graph = id(runtime.cycle.graph)
+    timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(
+        minutes=2
+    )
+
+    def query(session: str) -> tuple[int, int]:
+        turn, ticket = runtime.query_turn(
+            text="alpha concurrent",
+            dense=np.asarray([1.0, 0.0], dtype=np.float32),
+            session_key=session,
+            timestamp=timestamp,
+        )
+        return turn.node_id, ticket.prepared_state.current_event
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(
+            executor.map(query, ("test:a", "test:b"))
+        )
+
+    assert results == ((1, 1), (1, 1))
+    assert id(runtime.cycle.graph) == published_graph
+    assert runtime.cycle.state_version == 1
+    assert runtime.cycle.graph.current_event == 0
+    assert runtime.cycle.graph.turn_count == 1
     runtime.close()
 
 
