@@ -4,7 +4,9 @@ from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
+import pytest
 
+import akasha.application.cycle as cycle_module
 from akasha.application.cycle import MemoryCycle
 from akasha.domain.features import BurstAwareFeaturePool
 from akasha.domain.model import MemoryConfig, Turn
@@ -91,6 +93,45 @@ def test_stale_ticket_is_recomputed_on_latest_state() -> None:
     assert cycle.turns[-1].turn_id == delayed.turn_id
 
 
+def test_retrieve_restores_the_published_graph_in_place() -> None:
+    """Discard a speculative read frame without copying or advancing the graph."""
+
+    cycle = _replay([_turn(0), _turn(1)], MemoryConfig())
+    before = _cycle_state(cycle)
+    graph_identity = id(cycle.graph)
+
+    ticket = cycle.retrieve(_turn(2), capture_paths=True)
+
+    assert id(cycle.graph) == graph_identity
+    assert _cycle_state(cycle) == before
+    assert ticket.state_version == 2
+    assert ticket.prepared_turn_capacity == 3
+    assert ticket.prepared_state.current_event == 2
+
+
+def test_failed_retrieve_restores_the_published_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollback the speculative capacity and clocks when readout fails."""
+
+    cycle = _replay([_turn(0), _turn(1)], MemoryConfig())
+    before = _cycle_state(cycle)
+
+    def fail_readout(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("injected readout failure")
+
+    monkeypatch.setattr(
+        cycle_module,
+        "read_pattern_completion",
+        fail_readout,
+    )
+    with pytest.raises(RuntimeError, match="injected readout failure"):
+        cycle.retrieve(_turn(2), capture_paths=True)
+
+    assert _cycle_state(cycle) == before
+
+
 def test_preallocated_rebuild_matches_incremental_online_growth() -> None:
     turns = [_turn(index) for index in range(12)]
     config = MemoryConfig()
@@ -105,7 +146,6 @@ def test_preallocated_rebuild_matches_incremental_online_growth() -> None:
         ticket = replay.retrieve(
             turn,
             capture_paths=True,
-            isolate_graph=False,
         )
         replay.commit(turn, ticket)
 
@@ -195,7 +235,7 @@ def _cycle_state(cycle: MemoryCycle) -> dict[str, object]:
             graph.recurrence_log_m2,
             graph.recurrence_weight,
         ),
-        "last_external": graph.last_external_seed_seconds,
+        "last_external": dict(graph.last_external_seed_seconds),
     }
 
 

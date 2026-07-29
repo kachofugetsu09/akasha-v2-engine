@@ -62,9 +62,16 @@ python scripts/check_v8_parity.py \
 路径 A：启动 OnlineMemoryRuntime
         ├─ 恢复历史 prefix
         ├─ query_turn
+        │    ├─ 临时 advance 小型 RetrievalState
+        │    ├─ 读取同一个 committed graph
+        │    └─ finally 还原时钟与容量
         └─ TurnCommitted
              ├─ stage_from_source
              └─ publish_staged
+                  ├─ 校验 state_version
+                  ├─ 原地应用 RetrievalState 与学习
+                  ├─ 原子写 SQLite snapshot
+                  └─ 失败时从 durable prefix 恢复
 
 路径 B：同一 source index
         └─ rebuild_memory
@@ -75,6 +82,8 @@ members，而不是只比候选条数。测试同时覆盖：
 
 - 持久化 prefix 恢复后继续增长；
 - staged suffix 发布前不改变 graph snapshot，重启后能确定性补齐；
+- query 不复制 graph 且返回后完整还原 published graph；
+- 首次写入和已有 prefix 写入失败后都从持久化真源恢复；
 - stale ticket 在最新 state 上重算；
 - rebuild 预分配图与在线动态扩容一致；
 - source 中缺 dense 的 turn 不被丢弃；
