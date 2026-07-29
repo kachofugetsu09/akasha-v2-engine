@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ from akasha.infrastructure.sparse_index import (
     audit_source_embeddings,
     build_sparse_index,
 )
+from akasha.infrastructure.loader import load_turns
 
 
 class SparseIndexTest(unittest.TestCase):
@@ -179,6 +181,116 @@ class SparseIndexTest(unittest.TestCase):
             "1",
         )
 
+    def test_canonicalizes_message_feedback_into_causal_turn_targets(self) -> None:
+        """Resolve Message markers once so online and replay consume one input."""
+
+        # 1. Store a correction as forget-old plus remember-current.
+        self._insert_turn(
+            0,
+            "old claim",
+            "old answer",
+            [1, 0],
+            [1, 0],
+        )
+        self._insert_turn(
+            2,
+            "unrelated",
+            "unrelated answer",
+            [0, 1],
+            [0, 1],
+        )
+        self._insert_turn(
+            4,
+            "the correction",
+            "acknowledged",
+            [0.8, 0.2],
+            [0.8, 0.2],
+            user_extra={
+                "akasha_forget": {
+                    "schema_version": 1,
+                    "action": "forget",
+                    "target_turn_ids": ["test:0::test:1"],
+                },
+                "akasha_reinforce": {
+                    "schema_version": 1,
+                    "action": "remember",
+                    "target_turn_ids": ["current_turn"],
+                    "boost": 3.0,
+                },
+            },
+        )
+
+        build_sparse_index(self.source, self.output, self._config())
+        turns = load_turns(self.output)
+
+        self.assertEqual(turns[2].feedback.forget_nodes, (0,))
+        self.assertEqual(turns[2].feedback.remember_nodes, (2,))
+        self.assertEqual(turns[2].feedback.remember_boost, 3.0)
+        with closing(sqlite3.connect(self.output)) as connection:
+            row = connection.execute(
+                """
+                SELECT remember_targets_json, forget_targets_json
+                FROM sparse_turns WHERE turn_id='test:4::test:5'
+                """
+            ).fetchone()
+        self.assertEqual(
+            row,
+            ('["test:4::test:5"]', '["test:0::test:1"]'),
+        )
+
+    def test_feedback_change_invalidates_an_existing_sparse_turn(self) -> None:
+        """Keep marker payloads inside the append-only source digest."""
+
+        self._insert_turn(
+            0,
+            "stable",
+            "stable answer",
+            [1, 0],
+            [1, 0],
+        )
+        build_sparse_index(self.source, self.output, self._config())
+        with closing(sqlite3.connect(self.source)) as connection, connection:
+            connection.execute(
+                "UPDATE messages SET extra = ? WHERE id = 'test:0'",
+                (
+                    json.dumps(
+                        {
+                            "akasha_reinforce": {
+                                "schema_version": 1,
+                                "action": "remember",
+                                "target_turn_ids": ["current_turn"],
+                                "boost": 3.0,
+                            }
+                        }
+                    ),
+                ),
+            )
+
+        with self.assertRaises(AppendOnlyViolation):
+            build_sparse_index(self.source, self.output, self._config())
+
+    def test_forget_marker_requires_a_historical_target(self) -> None:
+        self._insert_turn(
+            0,
+            "cannot forget itself",
+            "answer",
+            [1, 0],
+            [1, 0],
+            user_extra={
+                "akasha_forget": {
+                    "schema_version": 1,
+                    "action": "forget",
+                    "target_turn_ids": ["current_turn"],
+                }
+            },
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "not causally available",
+        ):
+            build_sparse_index(self.source, self.output, self._config())
+
     def _config(self) -> BuildConfig:
         return BuildConfig()
 
@@ -214,6 +326,7 @@ class SparseIndexTest(unittest.TestCase):
         assistant_text: str,
         user_vector: list[float],
         assistant_vector: list[float],
+        user_extra: dict[str, object] | None = None,
     ) -> None:
         base = datetime(2026, 1, 1, tzinfo=timezone.utc)
         rows = [
@@ -223,7 +336,11 @@ class SparseIndexTest(unittest.TestCase):
                 seq,
                 "user",
                 user_text,
-                None,
+                (
+                    None
+                    if user_extra is None
+                    else json.dumps(user_extra)
+                ),
                 (base + timedelta(minutes=seq)).isoformat(),
             ),
             (

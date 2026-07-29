@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -73,6 +75,110 @@ def test_online_commit_matches_clean_rebuild(tmp_path: Path) -> None:
     runtime.close()
 
 
+def test_message_feedback_matches_online_restore_and_clean_rebuild(
+    tmp_path: Path,
+) -> None:
+    """Consume one canonical marker stream in all three execution paths."""
+
+    # 1. Publish a correction that forgets one turn and reinforces another.
+    sessions = tmp_path / "sessions.db"
+    index = tmp_path / "online-index.db"
+    online_memory = tmp_path / "online-memory.db"
+    replay_memory = tmp_path / "replay-memory.db"
+    _create_sessions(sessions)
+    _append_turn(sessions, 0, "old claim", [1.0, 0.0])
+    _append_turn(sessions, 2, "correct claim", [0.0, 1.0])
+    config = MemoryConfig()
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=online_memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=config,
+    )
+    started = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(
+        minutes=4
+    )
+    _, ticket = runtime.query_turn(
+        text="apply the correction",
+        dense=np.asarray([0.7, 0.7], dtype=np.float32),
+        session_key="test:one",
+        timestamp=started,
+    )
+    _append_turn(
+        sessions,
+        4,
+        "apply the correction",
+        [0.7, 0.7],
+        user_extra={
+            "akasha_forget": {
+                "schema_version": 1,
+                "action": "forget",
+                "target_turn_ids": ["message:0::message:1"],
+            },
+            "akasha_reinforce": {
+                "schema_version": 1,
+                "action": "remember",
+                "target_turn_ids": ["message:2::message:3"],
+                "boost": 3.0,
+            },
+        },
+    )
+    runtime.commit_from_source(
+        user_message_id="message:4",
+        assistant_message_id="message:5",
+        ticket=ticket,
+    )
+    rebuild_memory(index, replay_memory, target_sequences=())
+
+    # 2. Compare exact learned state and the persisted feedback audit.
+    assert runtime.cycle.inhibited_nodes == {0}
+    assert _logical_state(online_memory, index, config) == _logical_state(
+        replay_memory,
+        index,
+        config,
+    )
+    with sqlite3.connect(online_memory) as connection:
+        feedback_rows = connection.execute(
+            """
+            SELECT event_id, action, target_turn_node_id, boost
+            FROM feedback_events
+            ORDER BY event_id, action, target_turn_node_id
+            """
+        ).fetchall()
+    assert feedback_rows == [
+        (2, "forget", 0, 1.0),
+        (2, "remember", 1, 3.0),
+    ]
+
+    # 3. A future cue may use the old turn as a hidden bridge but cannot emit it.
+    query, future = runtime.query_turn(
+        text="old claim",
+        dense=np.asarray([1.0, 0.0], dtype=np.float32),
+        session_key="test:one",
+        timestamp=started + timedelta(minutes=2),
+    )
+    assert query.node_id == 3
+    assert 0 in dict(future.evidence.seed)
+    assert float(future.diffusion.reserve[0]) > 0.0
+    assert 0 not in {
+        item.node_id for item in future.completion.items
+    }
+    runtime.close()
+
+    restored = OnlineMemoryRuntime(
+        sessions_path=sessions,
+        index_path=index,
+        memory_path=online_memory,
+        embedding_model="text-embedding-v4",
+        embedding_dimension=2,
+        config=config,
+    )
+    assert restored.cycle.inhibited_nodes == {0}
+    restored.close()
+
+
 def test_staged_commit_publishes_the_same_logical_state(
     tmp_path: Path,
 ) -> None:
@@ -138,7 +244,19 @@ def test_failed_publication_restores_the_durable_prefix(
         config=MemoryConfig(),
     )
     durable_hash = sha256_file(memory)
-    _append_turn(sessions, 2, "alpha follows", [0.9, 0.1])
+    _append_turn(
+        sessions,
+        2,
+        "alpha follows",
+        [0.9, 0.1],
+        user_extra={
+            "akasha_forget": {
+                "schema_version": 1,
+                "action": "forget",
+                "target_turn_ids": ["message:0::message:1"],
+            }
+        },
+    )
     staged = runtime.stage_from_source(
         user_message_id="message:2",
         assistant_message_id="message:3",
@@ -156,6 +274,7 @@ def test_failed_publication_restores_the_durable_prefix(
 
     assert runtime.cycle.state_version == 1
     assert runtime.cycle.graph.current_event == 0
+    assert runtime.cycle.inhibited_nodes == set()
     assert [turn.turn_id for turn in runtime.cycle.turns] == [
         "message:0::message:1"
     ]
@@ -165,6 +284,7 @@ def test_failed_publication_restores_the_durable_prefix(
     monkeypatch.undo()
     runtime.publish_staged(staged)
     assert runtime.cycle.state_version == 2
+    assert runtime.cycle.inhibited_nodes == {0}
     runtime.close()
 
 
@@ -283,7 +403,7 @@ def test_runtime_loaders_do_not_run_full_database_integrity_check(
     statements: list[str] = []
     original_connect = sqlite3.connect
 
-    def traced_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+    def traced_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
         connection = original_connect(*args, **kwargs)
         connection.set_trace_callback(statements.append)
         return connection
@@ -611,6 +731,7 @@ def _append_turn(
     sequence: int,
     text: str,
     raw_vector: list[float],
+    user_extra: dict[str, object] | None = None,
 ) -> None:
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     user_time = base + timedelta(minutes=sequence)
@@ -626,7 +747,11 @@ def _append_turn(
                     sequence,
                     "user",
                     text,
-                    None,
+                    (
+                        None
+                        if user_extra is None
+                        else json.dumps(user_extra)
+                    ),
                     user_time.isoformat(),
                 ),
                 (

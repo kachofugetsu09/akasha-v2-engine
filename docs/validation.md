@@ -117,8 +117,37 @@ adapter 已按真实 Akasic Agent checkout 验证：
 ```
 
 `MemoryPlugin` 暴露 engine、admin、embedding API 和 closeables。查询阶段不
-改变图；`TurnCommitted` 是唯一事实写入入口。手工 remember、forget 和外部
-reinforce 不参与无监督学习。
+改变图；`TurnCommitted` 是唯一事实写入入口。手工 admin remember、forget
+和外部 reinforce 不参与无监督学习。随已提交 turn 持久化的 Message feedback
+是例外：remember 只增强目标 turn 在自身 episode 中的 membership，forget
+保留目标作为联想传播桥，但从最终召回结果和后续独立可塑性支持中隐藏。
+一次 remember 在 log-weight 空间应用现有图学习率：
+`gain = boost ** learning_rate`，随后重新归一化 episode 与 source 的连接预算；
+它不会增加局部总传导预算，也不会给整个语义簇或 query seed 追加奖励。
+
+## Message feedback 冻结快照实验
+
+2026-07-30 使用线上 `sessions.db` 的只读 SQLite backup 做了 4,840 个 turn
+的 baseline、remember 与 forget 全量因果重放；原库、运行中索引和服务均未修改。
+移除全部 feedback marker 后重建，16 张非 metadata 表与线上状态逐行一致，
+因此以下差异只来自 Message feedback。
+
+17 次真实 remember 的图节点和边集合完全不变。21,443 条关系中，raw weight
+变化超过 `1e-6` 的有 56 条；membership raw L1 变化占原总质量
+`0.0773%`。全部 4,840 个 query 的 Top-1 保持率为 `99.55%`，平均 Jaccard
+为 `0.9951`；与任一目标 embedding 相似度低于 `0.30` 的 117 个 query
+Top-1 全部不变。被标记内容进入召回的 query 比例从 `2.07%` 升至 `2.52%`，
+睡眠语义簇从 `17.51%` 升至 `19.87%`。11 个重点 query 的完整候选顺序均未
+变化，包括两条“昨晚睡得怎么样”审计 query；因此该机制证明了局部增强，
+但不声明它单独修复了历史 snapshot 误用事故。
+
+forget 实验从真实纠错中选择 7 个 marker、8 个错误 turn。marker 前 3,613
+个 query 完全一致；marker 后 1,227 个 query 的 Top-1 保持率为 `99.02%`，
+平均 Jaccard 为 `0.9874`。8 个目标的最终召回率从 `3.10%` 降为 `0`；
+与目标相似度低于 `0.30` 的 84 个 query 的完整候选顺序全部不变。被忘内容
+仍参与 residual diffusion，差异来自最终读出过滤、独立可塑性支持移除和
+burst context 移除，而不是删点或断边。相关语义簇会继续因后续因果学习产生
+可见变化，这是保留联想传播的预期 tradeoff。
 
 ## 测试边界
 

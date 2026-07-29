@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +9,8 @@ import pytest
 import akasha.application.cycle as cycle_module
 from akasha.application.cycle import MemoryCycle
 from akasha.domain.features import BurstAwareFeaturePool
-from akasha.domain.model import MemoryConfig, Turn
+from akasha.domain.graph import MEMBERSHIP
+from akasha.domain.model import MemoryConfig, Turn, TurnFeedback
 from akasha.infrastructure.persistence import (
     load_memory_state,
     write_memory_database,
@@ -152,23 +153,110 @@ def test_preallocated_rebuild_matches_incremental_online_growth() -> None:
     assert _cycle_state(replay) == _cycle_state(online)
 
 
+def test_feedback_replay_hides_forget_and_reinforces_own_membership() -> None:
+    """Keep forgotten turns as bridges and potentiate only the target episode."""
+
+    turns = [_turn(index) for index in range(4)]
+    neutral = _replay(turns[:3], MemoryConfig())
+    turns[2] = replace(
+        turns[2],
+        feedback=TurnFeedback(
+            remember_nodes=(2,),
+            forget_nodes=(0,),
+            remember_boost=3.0,
+        ),
+    )
+    cycle = _replay(turns[:3], MemoryConfig())
+
+    marker_evidence = cycle.evidence[2]
+    assert cycle.inhibited_nodes == {0}
+    assert marker_evidence == neutral.evidence[2]
+    neutral_edges = [
+        edge
+        for edge in neutral.graph.adjacency[2]
+        if neutral.graph.kind[edge] == MEMBERSHIP
+        and neutral.graph.source[edge] == 2
+    ]
+    own_hub = next(
+        hub for hub in neutral.graph.hubs if hub.created_event == 2
+    )
+    target_edge = next(
+        edge
+        for edge in neutral_edges
+        if neutral.graph.target[edge] == own_hub.node_id
+    )
+    changed_edges = [
+        edge
+        for edge, (before, after) in enumerate(
+            zip(
+                neutral.graph.weight,
+                cycle.graph.weight,
+                strict=True,
+            )
+        )
+        if not np.isclose(before, after)
+    ]
+    assert changed_edges == [target_edge]
+    assert cycle.graph.weight[target_edge] > neutral.graph.weight[target_edge]
+
+    old_cue = replace(
+        turns[3],
+        user_text=turns[0].user_text,
+        user_dense=turns[0].user_dense,
+        user_terms=turns[0].user_terms,
+    )
+    ticket = cycle.retrieve(old_cue, capture_paths=True)
+    assert 0 in dict(ticket.evidence.seed)
+    assert 0 not in {
+        item.node_id for item in ticket.completion.items
+    }
+    assert float(ticket.diffusion.reserve[0]) > 0.0
+
+
+def test_feedback_online_growth_matches_preallocated_replay() -> None:
+    turns = [_turn(index) for index in range(10)]
+    turns[6] = replace(
+        turns[6],
+        feedback=TurnFeedback(
+            remember_nodes=(5,),
+            forget_nodes=(1,),
+            remember_boost=3.0,
+        ),
+    )
+    config = MemoryConfig()
+    online = _replay(turns, config)
+    replay = MemoryCycle(
+        config,
+        turn_capacity=len(turns),
+        feature_pool=BurstAwareFeaturePool(turns),
+    )
+
+    for turn in turns:
+        replay.commit(
+            turn,
+            replay.retrieve(
+                turn,
+                capture_paths=True,
+            ),
+        )
+
+    assert _cycle_state(replay) == _cycle_state(online)
+    assert replay.inhibited_nodes == {1}
+
+
 def test_turn_without_dense_still_joins_lexical_temporal_memory() -> None:
     turns = [_turn(index) for index in range(3)]
-    unrelated = Turn(
-        **{
-            **asdict(turns[1]),
-            "user_text": "unrelated omega",
-            "assistant_text": "unrelated answer",
-            "user_terms": (("unrelated", 1), ("omega", 1)),
-            "assistant_terms": (("unrelated", 1), ("answer", 1)),
-        }
+    unrelated = replace(
+        turns[1],
+        user_text="unrelated omega",
+        assistant_text="unrelated answer",
+        user_terms=(("unrelated", 1), ("omega", 1)),
+        assistant_terms=(("unrelated", 1), ("answer", 1)),
     )
-    missing_dense = Turn(
-        **{
-            **asdict(turns[2]),
-            "user_dense": None,
-            "assistant_dense": None,
-        }
+    missing_dense = replace(
+        turns[2],
+        user_dense=None,
+        assistant_dense=None,
     )
     cycle = _replay(
         [turns[0], unrelated, missing_dense],
@@ -236,6 +324,7 @@ def _cycle_state(cycle: MemoryCycle) -> dict[str, object]:
             graph.recurrence_weight,
         ),
         "last_external": dict(graph.last_external_seed_seconds),
+        "inhibited_nodes": sorted(cycle.inhibited_nodes),
     }
 
 
