@@ -218,7 +218,8 @@ class AkashaMemoryEngine:
         notes={
             "truth": "sessions.db/messages",
             "learning": "unsupervised_memory_cycle",
-            "external_reinforcement": "ignored_by_design",
+            "message_feedback": "remember_and_forget_markers",
+            "legacy_item_reinforcement": "ignored_by_design",
         },
     )
 
