@@ -22,7 +22,10 @@ class _Embedder:
 
 class _Runtime:
     def __init__(self, turns: list[object]) -> None:
-        self.cycle = SimpleNamespace(turns=turns)
+        self.cycle = SimpleNamespace(
+            turns=turns,
+            inhibited_nodes=set(),
+        )
 
     def query_turn(self, **values: object) -> tuple[object, object]:
         timestamp = values["timestamp"]

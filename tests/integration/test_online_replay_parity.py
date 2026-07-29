@@ -153,7 +153,7 @@ def test_preallocated_rebuild_matches_incremental_online_growth() -> None:
     assert _cycle_state(replay) == _cycle_state(online)
 
 
-def test_feedback_replay_hides_forget_and_reinforces_one_self_edge() -> None:
+def test_feedback_replay_hides_forget_and_reinforces_own_membership() -> None:
     """Keep forgotten turns as bridges and potentiate only the target episode."""
 
     turns = [_turn(index) for index in range(4)]
@@ -161,7 +161,7 @@ def test_feedback_replay_hides_forget_and_reinforces_one_self_edge() -> None:
     turns[2] = replace(
         turns[2],
         feedback=TurnFeedback(
-            remember_nodes=(1,),
+            remember_nodes=(2,),
             forget_nodes=(0,),
             remember_boost=3.0,
         ),
@@ -173,13 +173,17 @@ def test_feedback_replay_hides_forget_and_reinforces_one_self_edge() -> None:
     assert marker_evidence == neutral.evidence[2]
     neutral_edges = [
         edge
-        for edge in neutral.graph.adjacency[1]
+        for edge in neutral.graph.adjacency[2]
         if neutral.graph.kind[edge] == MEMBERSHIP
-        and neutral.graph.source[edge] == 1
+        and neutral.graph.source[edge] == 2
     ]
-    target_edge = max(
-        neutral_edges,
-        key=lambda edge: (neutral.graph.weight[edge], -edge),
+    own_hub = next(
+        hub for hub in neutral.graph.hubs if hub.created_event == 2
+    )
+    target_edge = next(
+        edge
+        for edge in neutral_edges
+        if neutral.graph.target[edge] == own_hub.node_id
     )
     changed_edges = [
         edge
@@ -233,7 +237,6 @@ def test_feedback_online_growth_matches_preallocated_replay() -> None:
             replay.retrieve(
                 turn,
                 capture_paths=True,
-                isolate_graph=False,
             ),
         )
 

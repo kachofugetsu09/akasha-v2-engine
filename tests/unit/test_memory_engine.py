@@ -15,7 +15,7 @@ from akasha.domain.features import (
     FeaturePool,
     _sparsemax,
 )
-from akasha.domain.graph import MEMBERSHIP, DynamicMemoryGraph
+from akasha.domain.graph import HubRecord, MEMBERSHIP, DynamicMemoryGraph
 from akasha.domain.model import MemoryConfig, SeedEvidence, Turn
 from akasha.domain.readout import (
     PatternCompletion,
@@ -231,6 +231,130 @@ def test_parallel_episode_hubs_share_one_turn_side_connection_budget() -> None:
 
     assert inhibited == pytest.approx(0.8)
     assert sum(graph.weight[edge] for edge in edges) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("learning_rate", [0.25, 0.5, 1.0])
+def test_feedback_reinforcement_uses_graph_learning_rate(
+    learning_rate: float,
+) -> None:
+    """Apply one feedback event in the graph's existing log-weight dynamics."""
+
+    # 1. Build one unconstrained target membership below both local budgets.
+    graph = DynamicMemoryGraph(
+        2,
+        MemoryConfig(learning_rate=learning_rate),
+    )
+    edge = graph._add_edge(  # noqa: SLF001 - feedback rule fixture
+        source=0,
+        target=2,
+        kind=MEMBERSHIP,
+        bidirectional=True,
+        event=0,
+        initial_weight=0.2,
+        observed_credit=0.2,
+        recurrent_credit=0.0,
+    )
+    graph.hub_members[2] = [edge]
+    graph.hubs = [
+        HubRecord(
+            node_id=2,
+            created_event=0,
+            current_turn_id=0,
+            threshold=0.5,
+            innovation_mass=1.0,
+            member_edge_ids=(edge,),
+        )
+    ]
+
+    # 2. Verify boost is integrated by the existing plasticity rate.
+    graph.reinforce_feedback_nodes((0,), 3.0)
+
+    credit = learning_rate * np.log(3.0)
+    assert graph.weight[edge] == pytest.approx(0.2 * np.exp(credit))
+    assert graph.support_credit[edge] == pytest.approx(credit)
+    assert graph.independent_credit[edge] == pytest.approx(credit)
+
+
+def test_feedback_reinforcement_preserves_local_conductance_budgets() -> None:
+    """Keep repeated feedback inside the addressed episode and source budgets."""
+
+    # 1. Give the target a weak own episode and a stronger unrelated episode.
+    graph = DynamicMemoryGraph(2, MemoryConfig())
+    own_edge = graph._add_edge(  # noqa: SLF001 - feedback budget fixture
+        source=0,
+        target=2,
+        kind=MEMBERSHIP,
+        bidirectional=True,
+        event=0,
+        initial_weight=0.2,
+        observed_credit=0.2,
+        recurrent_credit=0.0,
+    )
+    peer_edge = graph._add_edge(  # noqa: SLF001 - feedback budget fixture
+        source=1,
+        target=2,
+        kind=MEMBERSHIP,
+        bidirectional=True,
+        event=0,
+        initial_weight=0.8,
+        observed_credit=0.8,
+        recurrent_credit=0.0,
+    )
+    other_edge = graph._add_edge(  # noqa: SLF001 - feedback budget fixture
+        source=0,
+        target=3,
+        kind=MEMBERSHIP,
+        bidirectional=True,
+        event=1,
+        initial_weight=0.7,
+        observed_credit=0.7,
+        recurrent_credit=0.0,
+    )
+    graph.hub_members = {
+        2: [own_edge, peer_edge],
+        3: [other_edge],
+    }
+    graph.hubs = [
+        HubRecord(
+            node_id=2,
+            created_event=0,
+            current_turn_id=0,
+            threshold=0.5,
+            innovation_mass=1.0,
+            member_edge_ids=(own_edge, peer_edge),
+        )
+    ]
+
+    # 2. Repeated confirmation may reallocate, but cannot create a black hole.
+    for _ in range(100):
+        graph.reinforce_feedback_nodes((0,), 3.0)
+
+    assert graph.weight[own_edge] > 0.2
+    assert sum(graph.weight[edge] for edge in (own_edge, peer_edge)) <= 1.0
+    assert sum(graph.weight[edge] for edge in (own_edge, other_edge)) <= 1.0
+    assert len(graph.weight) == 3
+
+
+def test_feedback_reinforcement_does_not_fall_back_to_other_episodes() -> None:
+    """Leave a target unchanged when it did not create an episode of its own."""
+
+    graph = DynamicMemoryGraph(2, MemoryConfig())
+    edge = graph._add_edge(  # noqa: SLF001 - feedback locality fixture
+        source=0,
+        target=3,
+        kind=MEMBERSHIP,
+        bidirectional=True,
+        event=1,
+        initial_weight=0.7,
+        observed_credit=0.7,
+        recurrent_credit=0.0,
+    )
+    graph.hub_members[3] = [edge]
+
+    graph.reinforce_feedback_nodes((0,), 3.0)
+
+    assert graph.weight[edge] == 0.7
+    assert graph.support_credit[edge] == 0.0
 
 
 def test_synaptic_resource_fatigues_in_burst_and_recovers_after_gap() -> None:

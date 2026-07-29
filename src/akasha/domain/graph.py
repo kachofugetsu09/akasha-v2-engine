@@ -12,7 +12,6 @@ from .model import DiffusionResult, MemoryConfig, PlasticityResult, SeedEvidence
 MEMBERSHIP = 0
 TEMPORAL_FORWARD = 1
 TEMPORAL_BACKWARD = 2
-FEEDBACK_EDGE_FRACTION = 0.6
 
 
 @dataclass(frozen=True)
@@ -343,7 +342,7 @@ class DynamicMemoryGraph:
         node_ids: tuple[int, ...],
         boost: float,
     ) -> None:
-        """Strengthen each target's self-edge inside its own episode."""
+        """Strengthen each target's membership in its own episode."""
 
         if boost == 1.0:
             return
@@ -354,7 +353,7 @@ class DynamicMemoryGraph:
             for hub in self.hubs
             if hub.created_event in node_ids
         }
-        gain = 1.0 + FEEDBACK_EDGE_FRACTION * (boost - 1.0)
+        gain = boost ** self.config.learning_rate
         credit = math.log(gain)
         affected_hubs = set()
         affected_sources = set()
@@ -363,32 +362,18 @@ class DynamicMemoryGraph:
         # 2. Potentiate the target membership without creating neighbor relations.
         for node_id in sorted(node_ids):
             own_hub = own_hubs.get(node_id)
-            edge_id = (
-                next(
-                    (
-                        edge
-                        for edge in own_hub.member_edge_ids
-                        if self.source[edge] == node_id
-                    ),
-                    None,
-                )
-                if own_hub is not None
-                else None
-            )
-            candidates = (
+            if own_hub is None:
+                continue
+            target_edges = tuple(
                 edge
-                for edge in self.adjacency[node_id]
-                if self.kind[edge] == MEMBERSHIP
+                for edge in own_hub.member_edge_ids
                 if self.source[edge] == node_id
             )
-            if edge_id is None:
-                edge_id = max(
-                    candidates,
-                    key=lambda edge: (self.weight[edge], -edge),
-                    default=None,
+            if len(target_edges) != 1:
+                raise RuntimeError(
+                    "own episode must contain exactly one target membership"
                 )
-                if edge_id is None:
-                    continue
+            edge_id = target_edges[0]
             self.weight[edge_id] = min(
                 1.0,
                 self.weight[edge_id] * gain,

@@ -1,4 +1,4 @@
-"""Plugin discovery and read-only inspection surfaces for Akasha V2."""
+"""Plugin lifecycle and read-only inspection surfaces for Akasha V2."""
 
 from typing import cast
 
@@ -21,7 +21,7 @@ _MOBILE_RECALL_ASSISTANT_PREVIEW_CHARS = 50
 
 
 class AkashaPlugin(Plugin):
-    """Register V2 memory inspection without exposing graph mutation."""
+    """Register Message feedback persistence and read-only inspection."""
 
     api_version = 2
     name = "akasha"

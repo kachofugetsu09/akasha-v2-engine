@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -243,7 +244,19 @@ def test_failed_publication_restores_the_durable_prefix(
         config=MemoryConfig(),
     )
     durable_hash = sha256_file(memory)
-    _append_turn(sessions, 2, "alpha follows", [0.9, 0.1])
+    _append_turn(
+        sessions,
+        2,
+        "alpha follows",
+        [0.9, 0.1],
+        user_extra={
+            "akasha_forget": {
+                "schema_version": 1,
+                "action": "forget",
+                "target_turn_ids": ["message:0::message:1"],
+            }
+        },
+    )
     staged = runtime.stage_from_source(
         user_message_id="message:2",
         assistant_message_id="message:3",
@@ -261,6 +274,7 @@ def test_failed_publication_restores_the_durable_prefix(
 
     assert runtime.cycle.state_version == 1
     assert runtime.cycle.graph.current_event == 0
+    assert runtime.cycle.inhibited_nodes == set()
     assert [turn.turn_id for turn in runtime.cycle.turns] == [
         "message:0::message:1"
     ]
@@ -270,6 +284,7 @@ def test_failed_publication_restores_the_durable_prefix(
     monkeypatch.undo()
     runtime.publish_staged(staged)
     assert runtime.cycle.state_version == 2
+    assert runtime.cycle.inhibited_nodes == {0}
     runtime.close()
 
 
@@ -388,7 +403,7 @@ def test_runtime_loaders_do_not_run_full_database_integrity_check(
     statements: list[str] = []
     original_connect = sqlite3.connect
 
-    def traced_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+    def traced_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
         connection = original_connect(*args, **kwargs)
         connection.set_trace_callback(statements.append)
         return connection
