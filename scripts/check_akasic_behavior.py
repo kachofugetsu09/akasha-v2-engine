@@ -56,6 +56,7 @@ class _Runtime:
             residual_l1=1e-8,
         )
         ticket = SimpleNamespace(
+            turn_id="pending",
             state_version=3,
             evidence=SimpleNamespace(seed=((0, 1.0),)),
             completion=completion,
@@ -116,6 +117,9 @@ async def _verify() -> None:
     engine._runtime = _Runtime(turns)  # noqa: SLF001
     engine._config = AkashaConfig()  # noqa: SLF001
     engine._lock = threading.RLock()  # noqa: SLF001
+    engine._pending_changed = threading.Condition(  # noqa: SLF001
+        engine._lock  # noqa: SLF001
+    )
     engine._commit_gate = asyncio.Lock()  # noqa: SLF001
     engine._publish_task = None  # noqa: SLF001
     engine._pending = {}  # noqa: SLF001
@@ -152,6 +156,7 @@ async def _verify() -> None:
             scope=MemoryScope(session_key="test:one"),
             limit=5,
             timestamp=timestamp,
+            context={"turn_id": "turn:behavior"},
         )
     )
     assert context.trace["effect"] == "stateful"
@@ -163,6 +168,13 @@ async def _verify() -> None:
     assert context.text_block.index("最近的主题") < context.text_block.index(
         "较早的主题"
     )
+    active = engine.wait_for_active_recall(
+        "test:one",
+        "turn:behavior",
+        timeout=0,
+    )
+    assert active is not None
+    assert active.query_id == "pending"
 
 
 def _turn(
