@@ -1,8 +1,8 @@
 # Akasha V2 显式记忆引擎设计规格
 
-- 状态：已实现并通过首版验收
-- 日期：2026-07-27
-- 目标仓库：`/mnt/data/coding/akasha-v2-engine`
+- 状态：已实现并通过验收
+- 日期：2026-07-27（首版），2026-07-30（更新至反馈与双路读出）
+- 目标仓库：`akasha-v2-engine`
 - 目标插件 ID：`akasha`
 - 设计基线：`/mnt/data/coding/akasha-v2` 的稳定 V8 机制与冻结评估结果
 
@@ -12,7 +12,7 @@ Akasha V2 是一个独立、可在线运行、可确定性重放的显式记忆�
 `user + assistant` 对话编码成稀疏索引，通过共同激活、时间关系、局部扩散、
 可塑性和自适应遗忘形成可持续生长的关联记忆。
 
-首版必须同时满足：
+必须同时满足：
 
 1. 召回效果与冻结的 Akasha V8 基线一致；
 2. 线上逐轮写入与离线按相同历史重放得到等价领域状态；
@@ -20,16 +20,12 @@ Akasha V2 是一个独立、可在线运行、可确定性重放的显式记忆�
 4. 所有学习来自对话、检索和历史复现，不依赖用户标签、外部确认或
    fast/slow/tag/reinforce 双轨机制；
 5. 数据库可以由 `sessions.db`、消息 embedding、算法版本和配置确定性重建；
-6. 代码可以作为整个 `plugins/akasha` 的替代来源，但本项目不负责修改或部署
-   Akasic Agent；
-7. 仓库最终初始化为独立 Git 仓库并发布为公开 GitHub 仓库
-   `akasha-v2-engine`。
+6. 代码可以作为整个 `plugins/akasha` 的替代来源；
+7. 仓库为独立 Git 仓库 `akasha-v2-engine`。
 
 ## 2. 非目标
 
-首版明确不做：
-
-- 修改 `/mnt/data/coding/akasic-agent`；
+- 修改 `akasic-agent`；
 - 迁移旧 Akasha sidecar schema；
 - 训练或微调 embedding 模型；
 - 把脑区名称直接映射成 Python 类；
@@ -39,8 +35,8 @@ Akasha V2 是一个独立、可在线运行、可确定性重放的显式记忆�
 - 后台物理删除和压缩陈旧节点；
 - 声称系统已经完整复现海马体或证明了 AGI。
 
-Dense 和 BM25 在首版中是构造稀疏 seed 的证据。返回结果仍以 V8 的显式模式
-补全读出为准，避免加入新结果通道后破坏冻结效果基线。
+Agent 发起的 Message-level feedback（remember / forget）是因果事实源
+的一部分，属于 `sessions.db` 中已持久化的 Marker，不是用户手工操作。
 
 ## 3. 事实源与系统边界
 
@@ -49,22 +45,30 @@ Dense 和 BM25 在首版中是构造稀疏 seed 的证据。返回结果仍以 V
 
 ```text
 ┌──────────────────── sessions.db ────────────────────┐
-│ messages / turns / message embeddings               │
-│ user 与 assistant 原文、稳定 ID、真实提交顺序         │
+│ messages / turns / message embeddings / feedback    │
+│ markers (akasha_reinforce / akasha_forget)          │
 └────────────────────────┬─────────────────────────────┘
                          │ read-only committed turns
                          ▼
+┌───────────── Sparse Index (akasha-v2-index.db) ──────┐
+│ sparse_turns / turn_dense / turn_terms / feedback    │
+│ 持久化 BM25 词典、embedding 身份、因果顺序             │
+└────────────────────────┬─────────────────────────────┘
+                         │ load_turns() + build_sparse_index()
+                         ▼
 ┌──────────────────── MemoryCycle ─────────────────────┐
-│ SparseIndexer → PatternCompleter → IndexReadout      │
-│                         │                            │
-│                         └→ PlasticityRule            │
-│                              + AdaptiveForgetting    │
+│ BurstAwareFeaturePool → residual_push                │
+│   → read_pattern_completion (两路)                   │
+│     → DynamicMemoryGraph.learn                       │
+│       → PlasticityRule + AdaptiveForgetting          │
 └────────────────────────┬─────────────────────────────┘
                          │ atomic MemoryUpdate
                          ▼
 ┌───────────────────── akasha.db ──────────────────────┐
-│ bindings / features / engrams / temporal relations  │
-│ plasticity / context / retrieval and learning trace │
+│ turn_nodes / feedback_events / hub_nodes /           │
+│ hub_memberships / temporal_edges / plasticity_clock  │
+│ / external_seed_state / memory_events / event_seeds  │
+│ / burst_context_members / context_state              │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -79,527 +83,585 @@ Akasha sidecar 保存消息 ID、用于在线读出的 turn 内容、派生特�
 ## 4. 与论文计算要求的对应
 
 本设计采用论文 *Position: Hippocampal Explicit Memory Is the Cornerstone for
-AGI* 的计算术语，但机制是工程实现，不把论文中的生物学类比当成已验证事实。
+AGI* 的计算术语，但机制是工程实现。
 
-| 论文要求 | Akasha V2 对象 | 首版承诺 |
+| 论文要求 | Akasha V2 对象 | 实现 |
 |---|---|---|
-| Sparse Indexing | `SparseIndexer`, `SparseIndex` | 完整实现 |
-| Error-Independent Update | `MemoryCycle`, `MemoryUpdate` | 无监督、无误差信号更新 |
-| Associative Construction | `AssociativeMemory`, `Engram`, `TemporalRelation` | 完整实现 |
-| Pattern Separation | `PatternSeparationTrace` | 可测量并回归，不声称等价于齿状回 |
-| Pattern Completion | `PatternCompleter`, `PatternCompletion` | 局部残差扩散实现 |
+| Sparse Indexing | `BurstAwareFeaturePool`, `FeaturePool` | dense + BM25 + time + context |
+| Error-Independent Update | `MemoryCycle`, `DynamicMemoryGraph.learn` | 无监督、无误差信号更新 |
+| Associative Construction | `DynamicMemoryGraph`, `Engram`, `TemporalRelation` | 因子化 hub 超边 |
+| Pattern Separation | `_tail_surprisal`, channel provenance | 可测量并回归 |
+| Pattern Completion | `residual_push`, `read_pattern_completion` | 两路扩散读出 |
 | Dynamicity | 增量 `MemoryState` | 每轮提交后在线更新 |
-| High and Instant Plasticity | `PlasticityRule` | 单次共同激活即可写入 |
-| Adaptive Forgetting | `AdaptiveForgetting` | 基于年龄和经验复现的有效强度 |
+| High and Instant Plasticity | Oja + resource gating | 单次共同激活即可写入 |
+| Adaptive Forgetting | 双对数正态 recurrence survival | 基于年龄和独立复现 |
+| Message Feedback | `reinforce_feedback_nodes`, `apply_feedback_inhibition` | remember/forget 因果标记 |
 
 论文使用的 dense 表示对应 `DenseRepresentation`。Embedding 模型本身承载跨
-样本学习得到的隐式模式；Akasha 不把它误称为本引擎训练出来的记忆。显式记忆
-负责把稀疏索引、事件关系和原始对话证据绑定起来。
+样本学习得到的隐式模式。显式记忆负责把稀疏索引、事件关系和原始对话证据绑定。
 
 ## 5. 领域语言
 
 ### 5.1 核心对象
 
-- `DenseRepresentation`：query 或 turn 的 embedding 表示；
-- `SparseIndexEvidence`：dense、BM25、上下文、时间和经验先验证据；
-- `SparseIndex`：少量带权激活项组成的稀疏编码；
-- `IndexBinding`：稀疏索引项与真实 turn/message ID 的绑定；
-- `Engram`：一次共同激活模式的因子化超边；
-- `TemporalRelation`：过去与当前之间的有向时间关系；
-- `MemoryState`：当前 bindings、engrams、关系、可塑性和上下文状态；
-- `PatternCompletion`：给定 partial index 后的稳定下界、残差和来源；
-- `MemoryUpdate`：一轮提交产生的原子领域变更；
-- `RecallResult`：提供给 Akasic Agent 的完成结果与审计轨迹。
-
-不使用 `DentateGyrus`、`CA3Neuron` 等脑区名称。代码名称表达计算职责，而不是
-假定工程模块与脑区一一对应。
+- `Turn`：全局因果顺序中的一个已提交 user+assistant 实例，携带 dense/BM25
+  特征、时间间隙和 `TurnFeedback`；
+- `ContextState`：当前 burst 的已完成上下文（归一化成员、pooled dense、pooled
+  词条）；
+- `SeedEvidence`：sparsemax 后的稀疏激活、通道支持、时间先验、continuation
+  信念和 surprise；
+- `BurstDecision`：一次 burst 边界判定结果，包含证据、base continuation、
+  context dependence、context mass、continued 标志和可见节点；
+- `DiffusionResult`：固定点下界 reserve、active_nodes、残差 L1、parent
+  provenance；
+- `PatternCompletion`：模式补全结果，按来源分类：sharp_completion、
+  basin_direct、basin_completion、relative_tail，含活跃 basin 数量；
+- `RecallCapture`：将一次查询与其 completion 绑定的持久化记录；
+- `PlasticityResult`：一轮学习事件产生的可审计变更；
+- `MemoryCycle`：单一因果状态机，在线和重放使用同一 `retrieve → commit` 流程；
+- `DynamicMemoryGraph`：存储 hub 超边（engram）、有向 temporal 边和全部
+  可塑性状态的领域图。
+- `RetrievalTicket`：携带 state_version、prepared_state 和
+  prepared_turn_capacity 的可逆检索票据；
+- `RetrievalState`：可逆的因果时钟快照，不复制图拓扑。
 
 ### 5.2 一轮记忆事件
 
-论文形式：
-
-\[
-f_{\text{memory}}(E_t, M_t) \rightarrow (\Delta M_t, Y_t)
-\]
-
-Akasha 的在线现实需要先给 LLM 返回记忆、等 assistant 落库后再学习，因此一个
-`MemoryCycle` 分为两个阶段：
+MemoryCycle 分为两个阶段：
 
 ```text
-MemoryCycle.retrieve(cue, state_n)
-    → RecallResult + RetrievalTicket(state_version=n)
+MemoryCycle.retrieve(turn, state_n)
+    → RetrievalTicket(state_version=n)
 
-MemoryCycle.commit(committed_turn, ticket, state_latest)
-    → MemoryUpdate + state_(latest+1)
+MemoryCycle.commit(turn, ticket, state_latest)
+    → CycleCommit + state_(latest+1)
 ```
 
-这两个阶段属于同一领域过程，不能分别实现成线上算法和重放算法。
+retrieve 在临时 advance 的图状态上运行 — grow 容量、prepare 时钟、run
+residual_push、run pattern completion — 然后 finally 块恢复为已发布状态。
+commit 时正式 advance 并持久化学习结果。同一周期同时用于在线和重放。
 
-## 6. 稀疏索引
+## 6. 稀疏索引与 burst 感知
 
 ### 6.1 Turn 定义
 
-一个可学习节点必须对应一个已经提交的逻辑 turn：
-
 ```text
 Turn
-├── turn_id
+├── node_id (全局因果位置)
+├── turn_id (稳定的 source message pair identity)
 ├── session_key
-├── user_message_id
-├── assistant_message_id
-├── user_text
-├── assistant_text
-├── user_embedding
-├── assistant_embedding
-├── started_at / completed_at
-└── stable source digest
+├── user_seq, user_message_id, assistant_message_id
+├── user_text, assistant_text
+├── user_dense, assistant_dense (已归一化的 embedding 或不完整)
+├── user_terms, assistant_terms (Jieba 词条及 tf)
+├── started_at, committed_at (UTC)
+├── inter_gap_seconds (到前一个全局 turn 的秒数)
+└── feedback (TurnFeedback: remember_nodes, forget_nodes, boost)
 ```
 
-首版只把已经提交且相邻的 `user + assistant` 消息组成 turn，不构造假消息补齐。
+缺少 dense 的 turn 不会跳过；embedding 身份不匹配或恶意向量在边界
+fail-loud。
 
-### 6.2 证据组成
+### 6.2 BurstAwareFeaturePool
 
-给定当前 query \(q_t\)，`SparseIndexer` 计算：
+`BurstAwareFeaturePool` 扩展 `FeaturePool`，维护每个 turn 的因果上下文依赖：
 
-\[
-E_t =
-\{
-e_{\text{query-dense}},
-e_{\text{query-bm25}},
-e_{\text{context-dense}},
-e_{\text{context-bm25}},
-e_{\text{temporal}},
-e_{\text{continuation}},
-e_{\text{surprise}}
-\}
-\]
+```python
+context_dependence[i] = percentile(term_effective_support(turn_i.user_terms),
+                                   observed supports before i)
+```
 
-其中：
+即每个 turn 的信息充分性在当前历史中的经验排名。高 rank → 低依赖；短句/歧义
+→ 高依赖。
 
-- query dense 和 BM25 提供当前内容的直接证据；
-- context dense 和 BM25 来自当前 session 已结算的前簇状态；
-- temporal evidence 来自增量时间模型，而不是固定“前 N 条”；
-- continuation 表示当前 query 延续现有 burst 的后验倾向；
-- surprise 衡量 query 相对于全局历史和当前 burst 的新颖程度。
+### 6.3 证据融合与 burst 边界
 
-融合不采用固定线性加权。V8 的可靠性调制、信息量调制和 sparsemax 稀疏化是
-冻结行为的一部分：
+给定当前 query q_t 和可见 burst 上下文：
 
-- 当前 query 信息充分、惊喜度高时，context 证据自动减弱；
-- 当前 query 短、歧义高或信息量低时，context 证据增强；
-- 重复定时任务因全局惊喜度低而不能持续垄断 seed；
-- 所有证据仍保留独立 provenance，不能先合成一个不可解释的分数。
+```text
+infer_burst_seed(index, candidate_context, visible_nodes)
+    → BurstDecision
 
-`SparseIndex` 是融合后的部分激活，不是仅携带多种字段的结构体。每个激活项
-必须记录融合前证据、融合后质量和选择责任。
+1. 分别计算 query 和 context 的 dense + BM25 对历史的 tail surprisal
+2. 计算基础 continuation 信念: P(continue | time, sim, surprise)
+3. burst_continuation = base + (1-base) * time_prior * context_dependence
+4. 若 continued: context_mass = combine_odds(continuation, context_dependence)
+5. 最终 seed = mix_sources(query_evidence, context_evidence, context_mass)
+```
 
-### 6.3 中文 BM25
+`_mix_sources` 非固定线性加权：对 query 证据和 context 证据分别做 sparsemax，
+然后按 context_mass 插值：
 
-首版采用固定版本的 Jieba lexical encoder，并把以下身份写入
-`engine_metadata`：
+```text
+seed[node] = (1 - context_mass) * sparsemax(query)[node]
+           + context_mass * sparsemax(context)[node]
+```
 
-- Jieba 包版本；
-- 基础词典摘要；
-- 自定义词典摘要；
-- normalizer 版本；
-- BM25 统计版本。
+context_mass 高时（短句/高依赖/已确认继续），context 通道支配 seed；
+surprise 高时，query 独走。
 
-线上和重放必须调用同一个 `LexicalEncoder`。依赖、词典或身份不匹配时失败，
-不能退回逐字切分、空 token 或另一套 FTS 实现。
+### 6.4 证据通道与 surge 检测
 
-### 6.4 增量 burst
+四个独立的 tail-surprisal 通道：
 
-burst 是随历史更新的连续状态，不是预先切好的 session 片段。当前 turn 只能看
-过去：
+```text
+query_dense → tail_surprisal(dense_scores(user_embedding, end))
+query_bm25  → tail_surprisal(bm25_scores(user_terms, end))
+context_dense, context_bm25 → 同上但对 candidate_context
+```
 
-\[
-p_t(\text{continue})
-=
-g(
-\Delta t,
-\operatorname{sim}(q_t,C_{t-1}),
-\operatorname{surprise}(q_t),
-\operatorname{uncertainty}(q_t)
-)
-\]
+Surprise 以 RMS 残差形式计算：
 
-`ContextState` 保存整个当前 burst 的结算表示，不只保存上一轮。发生明显 topic
-drift 时，新 query 的自身证据主导；短句或省略句则可沿同 burst 的累计上下文
-找到入口。burst 影响 seed 和时间关联，但同窗口内容不需要重复召回给 LLM。
+```text
+surprise = sqrt(mean([(1 - max(dense_prediction, 0))²,
+                      (1 - min(1, max(bm25) / self_score))²]))
+```
+
+预测上限是当前 query 在已记住模式中 dense/BM25 的最大匹配度。
+
+### 6.5 中文 BM25
+
+使用 Jieba `LexicalEncoder`，身份记录在 engine metadata：
+Jieba 版本、基础词典摘要、自定义词典摘要、normalizer 版本、BM25 统计版本。
+线上和重放使用同一编码器。
+
+### 6.6 增量 burst 成员
+
+burst 随 commit 更新：
+
+- continued=True → 追加当前 turn node_id 到 burst_members[ session_key ]
+- continued=False → 重新开始为 [ current_turn ]
+- 已 inhibited 的节点在构建 context 前即时移除
+- ContextState 由 pooled 的归一化 dense + BM25 terms 构成
 
 ## 7. 关联构造
 
 ### 7.1 Engram 超边
 
-一次共同激活模式 \(b_t\) 概念上产生：
-
-\[
-\Delta W_t = \eta_t b_t b_t^\top
-\]
-
-实际不展开成 \(O(k^2)\) clique，而保存一个 `Engram` 和 \(O(k)\) 条
-`EngramMembership`：
+一次共同激活产生因子化 hub:
 
 ```text
-              Engram H_t
-             ╱    │    ╲
+              Hub H_t
+             ╱   │   ╲
           turn a turn c turn f
 ```
 
-传播时等价为：
+每个 hub（engram）有 O(k) 条 `HubMembership` 双向边。传播时等价为：
 
-\[
-W_{\text{assoc}}x = B\Lambda(B^\top x)
-\]
+```text
+W_assoc x = B Λ (B^T x)
+```
 
-Engram 表示“这些索引曾在同一认知事件中共同激活”，不是人工主题标签。
+hub 创建由 `write_gain = evidence.surprise` 缩放，通过 `_integrated_members`
+用 factorized Oja 在 1.5-entmax 上投影活性：
+
+```text
+membership = entmax15(powered_activity * log1p(turn_count))
+```
 
 ### 7.2 时间有向关系
 
-同一 burst 内，过去 turn 到当前 turn 获得较强正向关系；当前到过去获得较弱
-反向关系：
+同一 burst 内 past → current 获得正向 temporal 边；current → past 获得较弱
+反向 temporal 边。倍率由 `reverse_temporal_ratio` 配置。
 
 ```text
-past ───────────────▶ current
-     strong forward
-
-past ◀─────────────── current
-     weaker recall
+past ───temporal_forward──▶ current  (weight ∝ continuation * write_gain * activity)
+past ◄──temporal_backward── current   (weight = reverse_temporal_ratio * forward)
 ```
 
-具体倍率属于冻结算法配置并参与 `algorithm_identity`，不得散落成代码常量。
-时间距离形成连续增益，不通过固定窗口决定“有边/无边”。
+时间距离影响可塑性但不确定"是否建立边"。有效权重 = 存储权重 × retention_factor。
 
-Engram 负责情景模式补全，时间关系负责顺序、前因和链式传播。二者不能混成一类
-边，否则无法解释关联来源。
+Temporal 边在传播时使用一个独立的 `TemporalGraphView`，只暴露非 membership
+边，用于度量时间可达性而不参与关联补偿。
 
-## 8. 模式补全
+## 8. 模式补全：两路读出
 
-### 8.1 转移图
+### 8.1 总体架构
 
-传播图由非负关系组合：
+读出不再使用单一图扩散，而是两条独立路线：
 
-\[
-A =
-\lambda_E A_E
-+ \lambda_F A_T
-+ \lambda_B A_T^\top
-\]
+```text
+read_pattern_completion(graph, pool, query, context, evidence, ...)
 
-按节点出边归一化得到行随机矩阵 \(P\)。连接预算使新增强关系占用有限质量，
-形成局部竞争，而不是让总强度无限增长。
+1. contextual route: full graph diffusion with active burst context
+   → 保持 V8 上下文路由的非破坏基线
 
-### 8.2 带重启的局部扩散
+2. independent (address) route: query-only diffusion without context
+   → 仅在 context_dependence < 1.0 时激活
+   → address_mass = sparsemax(log[1-dependence, dependence])[0]
 
-给定 seed \(s\)，模式补全固定点为：
+3. competitive_route_union(contextual, address, address_mass)
+   → 合并 completion 项，独立路由的新增候选经过共享 sparse 竞争
+```
 
-\[
-x^* = \alpha s + (1-\alpha)P^\top x^*
-\]
+这条分为两路的架构解决了短句依赖上下文时无法独立定位目标的问题，同时
+不让无关上下文淹没信息充分的 query。
 
-使用 residual push 求局部近似，维护：
+### 8.2 每条 route 的内部结构
 
-- `reserve`：已经结算的稳态激活下界；
-- `residual`：尚未展开的路径质量；
-- `provenance`：质量经过的 engram 和 temporal relation。
+每条 route 通过 `_read_route`：
 
-停止条件是：
+```text
+_read_route(graph, query, fields, basin_scores, continuation, ...)
 
-\[
-\lVert residual \rVert_1 \le \varepsilon
-\]
+1. _active_basins: 匹配每个 hub 的 raw engram 结构到当前评分
+   score = -expm1(-total_membership) * logsumexp(normalized_weights, values)
 
-而不是固定 hop 或固定 top-k。每次中间结果满足：
+2. _pooled_heads: 用 temperature scaling 选择 active basin
+   temperature = surprise_temperature(surprise, historical_surprise)
+                * binary_entropy(continuation)  (仅在非 burst 时)
+   用 sparsemax(scores / peak / temperature) 选 basin
 
-\[
-reserve \le x^*
-\]
+3. _accessibility_supported_heads: 筛选 conductance 仍高的 basin
+   只保留 head_accessibility = effective_mass / raw_mass 足以通过
+   gain_normalized_sparsemax 的
 
-并且剩余绝对误差由 residual 质量界定。循环只能积累成稳态，不能无限放大。
+4. _merge_overlapping_heads: 共享 direct seed 坐标的 basin 通过并查集合并
+   多个 hub 的 seed 按 mass 加权，输出合并 seed
 
-### 8.3 读出
+5. _diffuse_heads: 对每个选中的 basin 独立做两次 residual push
+   a. 全图 diffusion → basin_posterior, local_completion
+   b. temporal-only diffusion → temporal_posterior
+   聚合 sharp, direct, completion, relative_tail 分量
 
-`IndexReadout` 把结算激活聚合成 V8 的 basin completion 结果：
+6. relative_tail = entmax15( information * sqrt( temporal ) )
+   其中 information = basin * log(2*basin/(basin+sharp)) for basin > sharp
+```
 
-1. 按共享 engram、时间路径和可访问质量形成局部 basin；
-2. 用 accessibility 与局部 entmax 尾部保留相关 storyline；
-3. 依据 residual 误差界和调用方输出预算停止；
-4. 对相同 turn、相同 user/assistant message pair 去重；
-5. 通过 `IndexBinding` 解析真实消息。
+### 8.3 带重启的局部扩散 (Residual Push)
 
-模式补全内部不以固定候选数量为收敛条件。`MemoryQuery.limit` 和 LLM context
-预算是输出边界，不反过来改变图动力学。首版不额外混入独立 direct-dense 或
-direct-BM25 返回项。
+图传播使用 `IndexedMaxHeap` 实现的 residual push：
+
+```text
+x* = α s + (1-α) P^T x*
+
+每次迭代：
+  pop 最大 residual 节点 v
+  reserve[v] += α * residual[v]
+  对每个出邻居 u: residual[u] += (1-α) * residual[v] * P[v→u]
+  剩余未传播质量回到 seed 方向防止泄露
+```
+
+停止条件：`L1(residual) ≤ tolerance`。每次中间结果满足 `reserve ≤ x*`。
+
+`DynamicMemoryGraph.transitions()` 返回每节点的归一化 outward 质量，使用
+`-expm1(-total_weight)` 的饱和 spread——防止总质量超出 1.0。
+
+传播路径可通过 `parent_node` / `parent_edge` arrays 追踪，用于主导路径审计。
+
+### 8.4 读出与来源分类
+
+两类扩散分量：
+
+```text
+sharp_completion: sharp seed 扩散后，seed 节点之外的 completion
+basin_direct:     在 basin seed 中直接命中
+basin_completion: basin 扩散但不在 seed 中的节点
+relative_tail:    entmax15 尾部保留的相对增益且时间可达
+```
+
+最终 `_competitive_route_union` 合并两条路的 item：
+- contextual 的所有 item 保留
+- address 的 `basin_completion` 项与 contextual 的 score 一起做一次共享
+  sparsemax 竞争（除以各自峰值），仅通过的候选才加入最终集
+- 可见节点（当前 burst 内的）从最终集中排除
+
+去重、score 取 max、来源取并集。
 
 ## 9. 可塑性、抑制与遗忘
 
-### 9.1 激活即学习
+### 9.1 Oja 风格学习与资源门控
 
-一轮已提交 turn 的学习信号来自：
-
-- 当前 query 产生的直接 seed；
-- 模式补全结算激活；
-- 当前 turn 自身；
-- 当前 burst 的时间邻近关系；
-- 该模式在不同事件中的独立复现。
-
-没有 fast/slow memory、tag、用户确认或显式 reinforce。被检索到的节点会影响
-学习，但不会把全部召回质量原样写回，从而避免纯图循环自我证明。
-
-### 9.2 竞争和有限资源
-
-`PlasticityRule` 保留 V8 已验证的机制：
-
-- Oja 风格的归一化竞争；
-- 每个节点或关系的有限连接预算；
-- 刺激后的资源消耗与随时间恢复；
-- 随强刺激提高的可塑性阈值；
-- observed、independent 与 recurrent credit 分离；
-- 重复激活的边际增益递减。
-
-因此，关联可以在第一次共同激活时形成，但同一条重复 query 不能无限强化同一
-模式。增强某些连接时，其他连接在归一化预算中的份额自然受抑制。
-
-### 9.3 自适应遗忘
-
-常规读取不批量改写全图，而在访问时计算：
-
-\[
-w_{\text{effective}}(t)
-=
-w_{\text{stored}}
-\cdot
-S_{\text{recurrence}}
-(
-\Delta t,
-n_{\text{independent}},
-n_{\text{observed}},
-n_{\text{recurrent}}
-)
-\]
-
-真实、跨事件复现提高生存性；仅在一次 burst 内偶然共同激活、以后不再复现的
-节点逐渐失去有效质量。
+每条边在暴露于活性时经历 Oja 规则更新，由一个资源门控的 eligibility 调制：
 
 ```text
-第一次：query f → {a, c, e}
-第二次：query g → {a, b, c}
-后续：  a/b/c 独立复现，e 不再出现
-
-结果：  a/b/c 的有效支持恢复并稳定
-        e 的 membership 与访问质量随时间下降
+Δw = η · eligibility(resource, threshold, activity)
+    · hub_activity · (member_activity - hub_activity · w)
 ```
 
-召回会恢复部分可访问性，但恢复量受独立证据、资源和可塑性阈值限制。这样既不
-是单调只忘不激活，也不会让一次误召回永久存活。
+其中 eligibility 是三个因子的乘积：
 
-常规在线流程不物理删除节点。物理压缩属于单独维护能力，不进入首版关键路径。
+```text
+resource:  指数恢复 1 - (1-resource) * exp(-elapsed / resource_tau)
+threshold: 指数下降 threshold * exp(-elapsed / threshold_tau)
+drive:     activity * max(activity - threshold, 0)
+eligibility = resource * -expm1(-drive)
+```
+
+刺激后资源消耗 `resource *= exp(-activity)`，阈值提升
+`threshold += (1-threshold) * -expm1(-activity²)`。未受刺激的边资源
+逐步恢复、阈值逐步下降。
+
+### 9.2 有限连接预算
+
+- 每个 hub 的 membership 总权重 ≤ `recurrent_budget`
+- 每个 source turn 的所有 membership 出边总权重 ≤ `recurrent_budget`
+- temporal forward 源 ≤ `recurrent_budget`
+- temporal backward 源 ≤ `reverse_temporal_ratio * recurrent_budget`
+
+归一化是比例缩放的，包含抑制量。增强某些边 → 同源其他边归一化后缩小。
+
+### 9.3 双对数正态自适应遗忘
+
+常规访问时不批量改写全图。有效权重在每次访问时计算：
+
+```text
+w_effective = w_stored * retention_factor(edge_id)
+retention_factor = recurrence_survival(age)
+  where age = elapsed_seconds - last_support_seconds
+```
+
+`recurrence_survival` 使用在线 Welford 维护的双组件对数正态模型：
+
+```text
+观察到的每个外部 seed 复现事件 -> _observe_recurrence(gap_seconds, credit)
+  → 按 log-distance 分配到 short 或 long 组件
+  → 在线更新 mean, M2, weight
+
+survival(age) = Σ weight_i/Σweight · 0.5 · erfc( (ln(age) - μ_i) / (√2 · σ_i) )
+```
+
+`_support_edge` 部分更新 `last_support_seconds`：
+
+```text
+renewal = -expm1(-credit)
+last_support = previous + renewal * spacing
+```
+
+这样每个变激活的边适度延缓了老化时钟，但不等于完全重置。
+
+### 9.4 独立、观察与回放信用
+
+学习信号分为三类信用：
+
+- **observed_credit**: 当前 seed 直接命中的节点获得的 credit
+- **recurrent_credit**: 通过图扩散激活但与当前 seed 无关
+- **independent_credit**: 当前外部 seed 的几何平均 `√(source_external · target_external)`
+
+`_support_edge` 分别接收 support_credit（几何平均 `√(member_activity · hub_activity)`）
+和 independent_credit。
+
+### 9.5 Message Feedback: 记忆与抑制
+
+Message feedback 以从 `sessions.db` 引入的 `TurnFeedback` 形式到达每个 turn：
+
+```text
+TurnFeedback(remember_nodes, forget_nodes, remember_boost)
+```
+
+这是持久化在 source 中的因果 Marker，不是运行时 API。MemoryCycle 的 commit
+阶段在每个 turn 写入前应用反馈：
+
+```text
+inhibited_nodes.update(forget_nodes)
+inhibited_nodes.difference_update(remember_nodes)
+graph.apply_feedback_inhibition(inhibited_nodes)
+graph.learn(event, evidence, diffusion)
+graph.reinforce_feedback_nodes(remember_nodes, boost)
+```
+
+**Feedback inhibition** (`apply_feedback_inhibition`):
+从 `current_external` 中移除被抑制的 turn——阻止它们在当轮获得独立可塑性支持，
+但不删除图拓扑。
+
+**Feedback reinforcement** (`reinforce_feedback_nodes`):
+在 log-weight 空间增强目标 turn 在自身 episode 的 membership：
+
+```text
+gain = boost ** learning_rate
+w_target = min(1.0, w * gain)
+```
+
+随后重新归一化受影响的 hub 和 source 的传导预算。强化只作用于自身 episode，
+不会给语义簇或 query seed 追加奖励。
+
+**During readout**, `_exclude_recall_items` 在完成计算后从最终结果中移除
+inhibited 节点——它们仍参与图扩散，但不在用户可见的回忆结果中出现。
+
+### 9.6 Interaction of forgetting and feedback
+
+forget 保持节点在图中作为联想桥，但移除：
+1. 最终召回中的可见性
+2. 后续独立可塑性支持
+3. burst context 中的包含
+
+相关语义簇因后续因果学习可能产生可见变化——这是保留联想传播的预期 tradeoff，
+不是 bug。
 
 ## 10. 在线闭环
 
 ### 10.1 查询阶段
 
 ```text
-MemoryEngine.query
+AkashaMemoryEngine.query
   │
-  ├─ 校验 query / timestamp / embedding identity
-  ├─ 读取 MemoryState(version=n) 的不可变快照
-  ├─ SparseIndexer.encode
-  ├─ PatternCompleter.complete
-  ├─ IndexReadout.read
-  ├─ 返回 RecallResult 给 LLM
-  └─ effect=stateful 时持久化 RetrievalTicket
+  ├─ 校验 query / timestamp / embedding 身份
+  ├─ embed 用户文本 → 归一化向量
+  ├─ async commit_gate + event loop synchronization
+  ├─ OnlineMemoryRuntime.query_turn
+  │   └─ MemoryCycle.retrieve (在可逆读帧内)
+  ├─ engine._records: 生成 dense lane + completion lane
+  │   │
+  │   ├─ dense lane: ≤5 项纯 dense 相似度 (direct_dense)
+  │   ├─ completion lane: Ticket completion items 去重后取 ≤context_recall_limit 项
+  │   └─ 按时间排序展示
+  ├─ 若 intent=context + effect=stateful: 保留 PendingRetrieval
+  ├─ 若 intent=context: 生成 context block
+  └─ 返回 MemoryQueryResult
 ```
 
-`effect=read_only` 不写 ticket、不更新可塑性、不改变上下文，用于评估和管理
-查询。`timeline` 首版明确返回 unsupported trace；不能伪装成空的成功时间线。
+`effect=read_only` 不写 ticket、不更新可塑性、不改变上下文。
 
-### 10.2 提交阶段
-
-插件订阅 `TurnCommitted`，取得稳定 `turn_id`、user/assistant message ID 和
-timestamp：
+### 10.2 提交阶段 (两阶段 staging)
 
 ```text
 TurnCommitted
   │
-  ├─ 从 sessions.db 读取并验证真实消息
-  ├─ 取得或生成同模型 embedding
-  ├─ 关联 RetrievalTicket
-  ├─ 检查 ticket.state_version
-  ├─ 必要时在最新 MemoryState 上重新检索
-  └─ 一个 SQLite 事务提交 MemoryUpdate
+  ├─ 排除 scheduler session / skip_post_memory
+  ├─ 嵌入 user + assistant 真实文本 (重用/重新调用 embedding API)
+  │   若有匹配的 pending cue → 重用 query embedding
+  ├─ upsert 到 MessageEmbeddingStore
+  │
+  ├─ [stage] OnlineMemoryRuntime.stage_from_source
+  │   ├─ build_sparse_index → 增量持久化新 turn
+  │   ├─ load_turns → 验证新 suffix
+  │   ├─ 返回 StagedOnlineCommit
+  │   └─ 异步 publish
+  │
+  └─ [publish] OnlineMemoryRuntime.publish_staged
+      ├─ 获取 state_lock
+      ├─ 对每个 suffix turn 执行 cycle.retrieve + cycle.commit
+      ├─ write_memory_database → 原子 SQLite 快照
+      ├─ 失败时从持久化 snapshot 恢复 cycle
+      └─ 释放 stale pending
 ```
 
-如果 query 返回后图已经变化，commit 必须在最新版本重新计算学习状态，并在
-trace 中同时保存 served version 和 learned version。不能把过期 ticket 静默写入
-新图。
+retrieve 产生的 `RetrievalTicket` 携带 `prepared_turn_capacity` 和
+`prepared_state`，使 commit 可以精确恢复 read frame。若 ticket 丢失/陈旧，
+commit 在最新 state 上重新 evaluate。
 
-若 turn 没有对应 ticket，仍可用该 turn 的 user cue 在最新状态执行同一
-`MemoryCycle.retrieve`，再提交；这覆盖进程重启后的恢复，但必须在 trace 标记
-`retrieval_recomputed=true`。
+### 10.3 双向通道读出
 
-### 10.3 原子事务
+`engine._records` 生成两个独立的 lane：
+
+```text
+RetrievalRecords
+├── dense (tuple):     direct_dense lane ≤5 项
+└── completion (tuple): pattern completion lane
+    ├── sharp_completion: seed 扩散的图完成项
+    ├── basin_direct:      basin seed 直接命中
+    ├── basin_completion:  basin 扩散的图完成项
+    └── relative_tail:    entmax15 尾部稀有项
+```
+
+dense lane 和 completion lane 按 node_id 去重（dense 优先）。
+`strong` 相关性过滤排除纯 relative_tail。
+
+### 10.4 原子事务
 
 一轮事务同时提交：
 
-1. `processed_turns` 幂等记录；
-2. `IndexBinding` 和派生 turn feature；
-3. BM25 增量统计；
-4. memory event 与 sparse activation；
-5. engram 和 memberships；
-6. temporal relations；
-7. plasticity 与 forgetting 状态；
-8. session burst/context 状态；
-9. retrieval/learning trace；
-10. `state_version + 1`。
+1. `turn_nodes` 含幂等记录（重复 turn_id → 校验 → 确认，不覆盖）
+2. `feedback_events` 含因果 Marker 输入
+3. hub_nodes + hub_memberships + temporal_edges + plasticity_clock + external_seed_state
+4. memory_events + event_seeds + event_channel_support + event_channels
+5. burst_context_members + context_state
+6. recall_runs + recall_items
 
-任一步失败，整轮回滚。
+任一步失败，整轮回滚到上一个持久化 snapshot。
 
 ## 11. 重放与重建
 
-重放不是另一套算法：
+在线与重放使用同一个 `MemoryCycle`：
 
 ```text
 在线：
-query              → MemoryCycle.retrieve
-TurnCommitted      → MemoryCycle.commit
+AkashaMemoryEngine.query → OnlineMemoryRuntime.query_turn → MemoryCycle.retrieve
+TurnCommitted           → OnlineMemoryRuntime.stage_from_source + publish_staged
+                           → MemoryCycle.commit
 
 重放：
-CommittedTurnSource.iter_turns
-                   → MemoryCycle.retrieve
-                   → MemoryCycle.commit
+rebuild_memory
+  → load_turns(index_path) → BurstAwareFeaturePool
+  → for turn: cycle.retrieve → cycle.commit
+  → write_memory_database
 ```
 
-重建脚本 UX 参考旧 Akasha：
-
-```text
-python scripts/rebuild_akasha.py \
-  --config config.toml \
-  --sessions-db /path/to/sessions.db \
-  --db-path /path/to/akasha.db
-```
-
-执行顺序：
-
-```text
-预检 sessions.db / embedding / tokenizer / config
-  │
-创建临时 akasha.db
-  │
-按确定性全局顺序重放所有 committed turn
-  │
-校验 schema、不变量、逻辑 hash 和冻结 query suite
-  │
-备份已有目标库
-  │
-原子替换 akasha.db
-```
-
-预检全部通过前不能清空或替换目标库。缺少 dense 的完整 turn 仍以 BM25 和
-时间证据入库并记录计数；已有 embedding 非法、模型不一致、消息身份不完整或
-数据库损坏均以非零退出码失败，不允许跳过。
+预检全部通过前不能清空或替换目标库。embedding 非法、身份不完整或数据库损坏
+均以非零退出码失败。
 
 ## 12. 确定性
 
 全局 turn 顺序固定为：
 
 ```text
-started_at UTC
-→ session_key 的 UTF-8 bytes
-→ user_seq
-→ turn_id
+started_at UTC → session_key UTF-8 → user_seq → turn_id UTF-8
 ```
 
-实现必须满足：
+实现必须满足确定性要求列在 §12 原文中，并补充：
 
-- 所有 SQLite 查询显式 `ORDER BY`；
-- set 和 dict 进入算法前转换成稳定排序序列；
-- priority queue 使用稳定二级键；
-- 浮点聚合顺序固定；
-- NumPy dtype 明确；
-- 并列候选按稳定 turn ID 解决；
-- 随机机制如果保留，必须由持久化 seed 驱动；
-- Python `PYTHONHASHSEED` 不影响结果；
-- `algorithm_identity` 包含算法版本、图参数、embedding、tokenizer、词典和
-  feature schema；
-- 逻辑状态 hash 基于 canonical serialization，不基于 SQLite 文件字节或 rowid。
-
-相同 `sessions.db` 快照、embedding、配置和代码版本必须得到相同逻辑状态 hash。
+- `BurstAwareFeaturePool.context_dependence` 使用确定性 order statistics
+- `_IndexedMaxHeap` 以稳定二级键（node ID）平局
+- `entmax` / `entmax15` / `sparsemax` 均以 `np.flatnonzero` + 稳定排序
+- feedback marker 解析在 `load_turns` 时确定性地将 turn targets 转换为 node IDs
+- engine identity string: `"single_state_empirical_recurrence_survival_v9_feedback"`
 
 ## 13. 持久化模型
 
-### 13.1 表职责
+### 13.1 引擎版本
+
+```text
+engine: "single_state_empirical_recurrence_survival_v9_feedback"
+```
+
+Schema user_version = 2。
+
+### 13.2 表职责
 
 | 表 | 职责 |
 |---|---|
-| `metadata` | schema、算法、embedding、tokenizer、配置身份 |
-| `turn_nodes` | turn、真实 message IDs、文本缓存和全局顺序 |
-| `memory_events` | 每轮无监督 retrieve/commit 事件 |
-| `event_seeds` / `event_channels` | seed 及各证据通道 |
-| `activation_runs` / `activation_items` | reserve、residual 和激活下界 |
-| `hub_nodes` / `hub_memberships` | 因子化 engram 与可塑性状态 |
-| `temporal_edges` | 正反向时间关系与可塑性状态 |
-| `plasticity_clock` / `external_seed_state` | 复现时间尺度与外部 seed 时钟 |
+| `metadata` | schema、算法、embedding、tokenizer、配置身份、graph 容量 |
+| `turn_nodes` | turn、真实 message IDs、时间间隙 |
+| `feedback_events` | 当轮 remember/forget 的因果 marker 输入 |
+| `hub_nodes` | 因子化 engram 头、创建事件、阈值、innovation mass |
+| `hub_memberships` | 每 membership 边的 weight、effective_weight、observed/recurrent/support/independent credit、resource、plasticity_threshold、last_support/stimulated_seconds |
+| `temporal_edges` | 正/反向时间关系（和 membership 相同的可塑性列） |
+| `plasticity_clock` | 单行：elapsed_seconds、short/long gap 和 recurrence 统计、resource/threshold/retention tau |
+| `external_seed_state` | 每节点的最后外部 seed 时间 |
+| `memory_events` | 每轮 retrieve/commit 事件、时间先验、continuation、surprise、seed 大小、质量分解 |
+| `event_seeds` / `event_channel_support` / `event_channels` | seed 坐标、通道支持、事件级通道 |
+| `activation_runs` / `activation_items` | target 事件的 reserve、completion、graph-only completion、dominant path |
+| `recall_runs` / `recall_items` | 模式补全结果，按来源分解计数 |
 | `burst_context_members` / `context_state` | 各 session 当前 burst 与累计上下文 |
-| `recall_runs` / `recall_items` | 模式补全结果和 provenance |
 
-独立稀疏索引中的 `sparse_turns`、`turn_dense`、`turn_terms`、lexical/time
-statistics 都是性能缓存，不是事实源。索引保存 source digest 和 feature
-identity，任何历史变化或身份不匹配都要求重建。
-
-### 13.2 幂等
+### 13.3 幂等
 
 相同 `turn_id` 再次提交：
-
-- 消息 ID、source digest 和算法身份一致：确认已处理，不重复学习；
-- 任一身份不同：抛出冲突错误；
-- 不允许用 upsert 覆盖历史事实。
-
-### 13.3 schema 生命周期
-
-首版使用全新 schema v1，不读取旧 Akasha schema。旧库到新库的迁移方式是从
-事实源重建。以后 schema 变化必须显式提升版本；不提供静默自动迁移。
+- 消息 ID、source digest 和算法身份一致：确认已处理，不重复学习
+- 任一身份不同：抛出冲突错误
 
 ## 14. Akasic Agent 插件契约
 
 ### 14.1 插件构造
 
-`memory_plugin.py` 实现：
-
-```text
-MemoryPlugin.plugin_id = "akasha"
-MemoryPlugin.ensure_workspace_storage(...)
-MemoryPlugin.build(deps) → MemoryPluginRuntime
-```
-
-`MemoryPluginRuntime` 提供：
-
-- `engine=AkashaMemoryEngine`；
-- `admin=engine`；
-- `embedding_api=engine.embedding_api`；
-- 数据库连接和事件订阅对应的 `closeables`。
-
-只有 adapter 层导入 Akasic Agent 的 `core.memory.*`、`TurnCommitted` 和配置类型。
-domain、application、SQLite store 均不能反向依赖 host。
+`memory_plugin.py` → `AkashaMemoryEngine`：
+- plugin_id = "akasha"
+- 暴露 engine、admin、embedding API 和 closeables
 
 ### 14.2 `MemoryEngine` 方法
 
-| 接口 | 首版行为 |
+| 接口 | 行为 |
 |---|---|
-| `query` | context/answer/interest/procedure 使用显式模式补全；timeline 明确 unsupported |
+| `query` | context/answer/interest/procedure 使用两路显式模式补全；timeline 明确 unsupported；输出 dense + completion 双 lane |
 | `ingest` | 仅接受带稳定 message IDs 的 `conversation_turn`；主入口由 `TurnCommitted` adapter 调用 |
-| `mutate` | remember/forget 返回 `accepted=False, status=unsupported` |
-| `reinforce_items_batch` | 明确的确定性 no-op；外部引用不参与无监督可塑性 |
-| `describe` | 声明 rich memory、semantic retrieval、context block、graph relation 能力 |
-| `tool_profile` | 只公开 recall；不公开 memorize、forget、reinforce |
-| `keyword_match_procedures` | 返回空列表；Akasha 不是 workflow engine |
-| 时间事件与 dashboard 读取 | 查询 `memory_events`、bindings、engrams 和 trace |
+| `mutate` | remember/forget 返回 `accepted=False, status=unsupported` — 不使用 admin API |
+| `reinforce_items_batch` | 明确的确定性 no-op |
+| `describe` | 声明 RICH_MEMORY_ENGINE + 6 项能力 |
+| `tool_profile` | 公开 recall_memory + remember_memory + forget_memory 三项工具 |
+| `stage_feedback` / `take_staged_feedback` | Agent 调用的 Message 级反馈：解析 Message ID → turn ID，与 current_turn 绑定，通过 AkashaFeedbackPersistModule 持久化 |
+| `keyword_match_procedures` | 返回空列表 |
+| 时间事件与 dashboard 读取 | 查询 memory_events、bindings、engrams 和 trace |
 | dashboard update/delete | 抛出明确的 unsupported operation |
-| dashboard similar | 返回 dense 相似与显式关联 provenance，但不产生学习 |
-
-`reinforce_items_batch` 的 no-op 是领域选择，不是异常 fallback：该接口没有返回值，
-而 Akasha 的学习责任只属于 `MemoryCycle`。实现必须通过注释、descriptor notes
-和测试明确这一点。
 
 ### 14.3 返回映射
 
@@ -607,269 +669,150 @@ domain、application、SQLite store 均不能反向依赖 host。
 
 ```text
 MemoryRecord
-├── id: stable turn/index binding ID
+├── id: stable turn ID
 ├── kind: "episodic_turn"
-├── summary: 从 sessions.db 解析的 user + assistant 摘要
-├── score: 读出后的可访问质量
+├── summary: user + assistant 摘要
+├── score: 读出质量 (dense cos 或 completion score)
 ├── engine_kind: "akasha"
 ├── evidence
 │   └── EvidenceRef(kind="message_range", refs=[user_id, assistant_id])
-└── signals
-    ├── seed evidence
-    ├── completion mass
-    ├── basin identity
-    ├── engram paths
-    ├── temporal paths
-    ├── effective age/survival
-    └── served/learned state version
+├── signals
+│   ├── lane: "dense" | "completion"
+│   ├── sources: ["sharp_completion" | "basin_direct" | "basin_completion" | "relative_tail" | "direct_dense"]
+│   ├── basin_ids: 促成召回的 hub ID 列表
+│   ├── started_at, user_text, assistant_preview
+│   └── also_completed: 该 dual-lane item 是否也出现在另一条 lane
+└── injected: 是否用于 context 注入
 ```
 
-`text_block` 只在 `intent=context` 时生成，并受调用方 context 预算控制。
-`MemoryRecord.summary` 不是新的事实副本；它是本次查询从原始消息渲染出的视图。
+text_block 只在 `intent=context` 时生成，分"左脑记忆（精确回忆）"和
+"右脑联想（潜意识第一反应）"两部分，受 `inject_max_chars` 预算控制。
 
 ## 15. 代码边界
 
 ```text
-akasha-v2-engine/
-├── src/akasha/
-│   ├── domain/          # feature、graph、diffusion、readout
-│   ├── application/     # shared cycle、online runtime、rebuild
-│   ├── infrastructure/  # sessions/index、SQLite、writer lease
-│   ├── engine.py        # Akasic MemoryEngine adapter
-│   ├── memory_plugin.py # Akasic MemoryPlugin factory
-│   ├── inspector.py     # read-only retrieval projection
-│   ├── dashboard.py     # desktop Inspector API
-│   ├── dashboard_panel_inspector.{ts,css}
-│   └── mobile_ui.{js,css}
-├── scripts/             # rebuild、parity、report、contract
-└── tests/
-    ├── unit/
-    └── integration/
+akasha-v2-engine/src/akasha/
+├── domain/
+│   ├── model.py       # Turn, ContextState, SeedEvidence, DiffusionResult, PlasticityResult, Capture, TurnFeedback, MemoryConfig
+│   ├── features.py    # FeaturePool, BurstAwareFeaturePool, BurstDecision, BM25, burst logic, sparsemax, entmax
+│   ├── graph.py       # DynamicMemoryGraph (hubs, edges, plasticity, recurrence), RetrievalState
+│   ├── diffusion.py   # residual_push, IndexedMaxHeap, TransitionGraph protocol
+│   └── readout.py     # read_pattern_completion, two-route architecture, basin/head selection, entmax variants
+├── application/
+│   ├── cycle.py       # MemoryCycle (retrieve + commit), RetrievalTicket, CycleCommit
+│   ├── runtime.py     # OnlineMemoryRuntime (stage + publish, crash recovery)
+│   └── rebuild.py     # rebuild_memory, deterministic_metadata
+├── infrastructure/
+│   ├── loader.py      # load_turns from sparse index
+│   ├── persistence.py # write_memory_database / load_memory_state, SQLite schema
+│   ├── lease.py       # writer lease
+│   └── sparse_index/  # build_sparse_index, encoding (Jieba), model, schema
+├── engine.py          # AkashaMemoryEngine (Akasic Agent adapter), feedback staging
+├── memory_plugin.py   # MemoryPlugin factory
+├── config.py          # AkashaConfig load/validate/render
+├── inspector.py       # read-only retrieval projection
+├── dashboard.py / dashboard_panel_inspector.{ts,css} / mobile_ui.{js,css}
+└── cli.py
 ```
 
 依赖方向：
 
 ```text
-Akasic Agent adapter
-          │
-          ▼
+Akasic Agent adapter (engine.py, memory_plugin.py)
+         │
+         ▼
 application ─────────▶ domain
      │                    ▲
      ▼                    │
 application ports ◀── infrastructure
 ```
 
-domain 不导入 SQLite、Akasic Agent 或网络客户端。`memory_plugin.py`、`engine.py`
-和只读 Inspector adapter 使用相对导入，使整包以后可以作为 `plugins.akasha`
-放入 host，而不用改写核心模块。Inspector 只能读取已经提交的 sidecar；它不是第二个
-检索或学习实现。
+domain 不导入 SQLite、Akasic Agent 或网络客户端。
 
 ## 16. 错误处理
 
-信任边界集中在：
+信任边界：
+- Akasic Agent `MemoryQuery` / `MemoryIngestRequest` / `TurnCommitted`
+- config 加载
+- sessions/akasha/index SQLite 读取
+- embedding 响应
+- feedback marker 解析
+- rebuild CLI
 
-- Akasic Agent `MemoryQuery` / `MemoryIngestRequest`；
-- `TurnCommitted`；
-- config 加载；
-- sessions/akasha SQLite 读取；
-- embedding 响应；
-- rebuild CLI。
-
-边界通过后，domain 信任已经验证的 dataclass 和不变量，不在每层重复
-`None`、空字符串和默认值检查。
-
-以下情况必须 fail-fast、fail-loud：
-
-- query 缺少 timestamp；
-- committed turn 缺稳定消息 ID；
-- source digest 不一致；
-- 已存在 embedding 的维度错误、非有限值或模型身份变化；
-- tokenizer/词典身份变化；
-- turn 逆序或同 ID 内容冲突；
-- schema/algorithm identity 不兼容；
-- SQLite 损坏；
-- residual push 违反质量守恒；
-- 事务提交失败。
-
-只捕获能够在当前位置转换或恢复的具体异常。不得用空召回、默认向量、跳过
-turn、动态 import 或宽泛异常吞掉问题。
+必须 fail-fast、fail-loud 的情况同 §16 原文，补充：
+- feedback remember/forget 节点不在因果范围内
+- inhibited nodes 与 remembered nodes 在同一 turn 中重叠
+- 图容量在 commit 时收缩
+- 多个 staged commit 同时 publish
 
 ## 17. 并发和恢复
 
-- 图写入采用单写者语义；
-- query 从带 `state_version` 的不可变快照读取；
-- SQLite 事务序列化 `MemoryUpdate`；
-- 进程崩溃时未提交事务自动回滚；
-- 启动时扫描事实源中晚于最新 `processed_turns` 的 committed turn；
-- 缺 ticket 的 turn 通过同一 retrieve/commit 过程重算；
-- 重算必须记录原因，不视作正常 ticket 命中；
-- 关闭时撤销事件订阅并关闭所有数据库资源。
+- 图写入采用单写者语义（`WriterLease`）
+- query 从 reversible read frame 读取（grow → prepare → process → restore）
+- SQLite 事务序列化 `MemoryUpdate`
+- 进程崩溃时未提交事务自动回滚
+- 启动时扫描事实源中晚于最新 `processed_turns` 的 committed turn
+- 缺 ticket 的 turn 重温 cause 并标记 `retrieval_recomputed=true`
+- 在线 publish 失败时从 `akasha.db` 持久化 prefix 恢复 `MemoryCycle`
+- 关闭时撤销 event 订阅、drain 异步 publication、回收所有数据库资源
+- feedback marker 在 staging 阶段即持久化到 sparse index，publish 阶段应用
 
-首版不引入分布式锁或多进程写入。多个进程同时指向同一个可写 sidecar 属于
-配置错误，启动时应通过 writer lease 明确失败。
+`RetrievalState` 和 `RetrievalTicket.prepared_state` 使 retrieval 可以回滚
+弹性时钟（elapsed_seconds、recurrence stat 等）而不需要复制整个图。
 
 ## 18. 验证与验收
+
+（与原文一致，补充完整）
 
 ### 18.1 单元测试
 
 覆盖：
-
-- 证据融合、sparsemax 和稳定 tie-break；
-- 增量 BM25 与批量重算一致；
-- burst 只使用过去信息；
-- residual push 的 reserve 下界、残差误差和质量守恒；
-- engram 因子化传播与概念矩阵等价；
-- 时间关系方向性；
-- 连接预算阻止重复输入无限增长；
-- 资源消耗、恢复和阈值调节；
-- 经验复现使偶然节点逐渐弱化；
-- 不同 `PYTHONHASHSEED` 的确定性。
+- 证据融合、sparsemax / entmax15 / entmax 的稳定 tie-break
+- 增量 BM25 与批量重算一致
+- burst 只使用过去信息
+- context_dependence 为经验排名不变性
+- residual push 的 reserve 下界、残差误差和质量守恒
+- engram 因子化传播与概念矩阵等价
+- 时间关系方向性、TemporalGraphView 的正确性
+- 连接预算阻止重复输入无限增长
+- 资源消耗、恢复和阈值调节
+- 双对数正态 recurrence survival 的统计特性
+- feedback remember/forget 因果验证和边界
+- inhibited nodes 在图传播中完整、在召回结果中隐藏
+- 不同 `PYTHONHASHSEED` 的确定性
 
 ### 18.2 合成机制实验
 
-公共测试使用合成内容，不提交用户私人对话：
+（与原文 §18.2 一致，补充 feedback 相关测试）
 
-1. `a/c/e → a/b/c → b/c/d` 验证稳定核心和偶然 `e` 的自净化；
-2. burst 内插入无关节点，后续多个独立 burst 重复主故事，验证噪声流入质量下降；
-3. 短句依靠累计 burst context 找回前文，信息充分的新主题不被旧 context 吞没；
-4. 高频重复任务在连接预算和惊喜度作用下不无限强化；
-5. 只出现一次的事件仍能通过一次性 engram 被部分 cue 找回；
-6. 相似语义但不同经历的 sparse overlap 低于 dense similarity 所暗示的混淆，
-   同一经历的不同 cue 又能完成到同一 basin。
+7. remember 增强 target turn 在自身 episode 的 membership 而不增加总预算
+8. forget 隐藏 target turn 的召回同时保留联通性桥接
+9. 冲突反馈 (same turn 记住又忘记同一目标) 在边界拒绝
 
-### 18.3 V8 私有效果基线
+### 18.3–18.6
 
-真实 `sessions.db`、冻结查询和完整召回正文属于本地私有验收材料，放入
-`private-data/` 并由 `.gitignore` 排除。
-
-验收比较：
-
-- 每个 query 是否仍覆盖冻结 V8 的目标情景；
-- 召回集合差异和长尾掉落；
-- basin、completion mass 和 provenance；
-- 噪声条目变化；
-- 每轮 sparse index、reserve、integrated activation；
-- engram、temporal relation、plasticity、context state；
-- 最终 logical state hash。
-
-排名不是首要目标，但冻结候选不能因小改动无声消失。任何差异必须生成可读
-parity report，不能只报告 aggregate score。
-
-### 18.4 在线—重放等价
-
-用同一合成 turn stream 建立两份独立数据库：
-
-```text
-DB A：逐轮走 MemoryEngine.query + TurnCommitted adapter
-DB B：走 rebuild CommittedTurnSource
-```
-
-逐事件比较 canonical snapshot，最终比较 logical state hash 和 query recall
-集合。测试不能让两条路径共享同一个已变更数据库，也不能用重放结果直接喂给
-在线路径。
-
-### 18.5 故障测试
-
-必须覆盖：
-
-- embedding miss；
-- embedding model/config mismatch；
-- tokenizer identity mismatch；
-- duplicate turn identity conflict；
-- out-of-order turn；
-- query 后、commit 前图版本变化；
-- SQLite 事务各阶段崩溃注入；
-- 临时重建失败时旧目标库保持完整；
-- `effect=read_only` 不改变 logical state hash。
-
-### 18.6 性能
-
-在同一冻结快照上记录：
-
-- 全量重建总时间、峰值 RSS 和数据库大小；
-- 单轮 indexing、completion、readout、commit 耗时；
-- residual push 访问节点/边数量；
-- NumPy dense 批量计算与 BM25 倒排候选成本。
-
-远程 embedding 延迟不计入图引擎性能。当前本地数据规模下，完成扩散与读出、
-事务提交各自的 p95 必须低于 1 秒，才能标记为可在线使用。性能优化不得改变
-canonical recall set 或 logical state hash。
+V8 私有 parity、在线-重放等价、故障测试、性能要求与原文一致。
 
 ## 19. 论文要求的可证伪边界
 
-### 19.1 Pattern separation
-
-`PatternSeparationTrace` 至少记录：
-
-- dense cosine similarity；
-- sparse support overlap；
-- weighted Jaccard；
-- basin overlap；
-- write responsibility；
-- cross-story confusion。
-
-证明目标不是“最终只激活少量节点”，而是：
-
-1. 相似但属于不同经历的输入，在 sparse/basin 空间比 dense 空间更少混淆；
-2. 同一经历的不同 partial cue 仍能落到共同 basin；
-3. 增强分离后，冻结 query 的 storyline coverage 不显著下降。
-
-如果只能满足前两项中的一项，就不能宣称完成模式分离。
-
-### 19.2 Pattern completion
-
-完成必须通过反事实消融验证：
-
-- 完整图；
-- 去掉 engram；
-- 去掉 temporal relation；
-- 只保留 direct seed。
-
-只有 seed 未直接命中、但完整图通过可审计路径恢复的目标 turn 才计为 completion。
-返回更多候选本身不构成模式补全证据。
-
-### 19.3 Adaptive forgetting
-
-遗忘实验必须跟踪同一噪声节点在后续独立复现中的：
-
-- raw membership；
-- effective membership；
-- residual inflow；
-- final readout inclusion；
-- 与稳定核心的相对质量。
-
-只有它相对核心持续下降并最终退出读出，同时核心仍可完成，才能证明自净化机制
-成立。
+（与原文一致）
 
 ## 20. 交付边界
 
-实现完成后的仓库交付必须包括：
-
-- 根目录 `AGENTS.md`，采用本项目已确认的中文、fail-loud 和叙事式函数规范；
-- 完整源码、CLI、测试和 README；
-- `private-data/` 写入 `.gitignore`；
-- 首次 commit；
-- 通过当前 Akasic Agent 接口契约测试；
-- 通过合成机制测试、V8 私有 parity 和在线—重放等价测试；
-- 使用当前已认证 GitHub 账号创建公开仓库 `akasha-v2-engine`；
-- push 首次提交并确认远端 visibility 为 public。
-
-首版实现、真实重放、协议验证和公开仓库发布状态记录在
-`docs/validation.md`。
+（与原文一致，补充）
+- 实现 feedback staging + AkashaFeedbackPersistModule 集成
+- 通过 feedback marker 的因果重建验证
 
 ## 21. 参考资料
 
 1. *Position: Hippocampal Explicit Memory Is the Cornerstone for AGI*,
-   arXiv:2606.11245, <https://arxiv.org/abs/2606.11245>
-2. *RF-Mem*, arXiv:2605.05097,
-   <https://arxiv.org/abs/2605.05097>
+   arXiv:2606.11245
+2. *RF-Mem*, arXiv:2605.05097
 3. Andersen, Chung, Lang, *Local Graph Partitioning using PageRank Vectors*,
-   FOCS 2006.
+   FOCS 2006
 4. Oja, *Simplified neuron model as a principal component analyzer*,
-   Journal of Mathematical Biology, 1982.
+   Journal of Mathematical Biology, 1982
 5. Bi and Poo, *Synaptic Modifications in Cultured Hippocampal Neurons*,
-   Journal of Neuroscience, 1998.
-
-其中第 1 篇提供显式记忆计算要求和术语；第 2 篇只作为检索组织的旁证，不是
-Akasha 架构主线；PageRank、Oja 和 STDP 文献分别支撑局部收敛扩散、归一化竞争
-和有向时间可塑性的工程选择。
+   Journal of Neuroscience, 1998
+6. Peters, Niculae, Martins, *Sparse Sequence-to-Sequence Models*,
+   ACL 2019 (entmax 系列)
