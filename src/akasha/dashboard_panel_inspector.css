@@ -1,20 +1,20 @@
 /* Akasha Inspector — host industrial tokens, content-first, no private palette. */
 
 .akasha-inspector {
-  --akasha-ink: var(--color-fg);
-  --akasha-muted: var(--color-muted);
-  --akasha-subtle: var(--color-subtle);
-  --akasha-surface: var(--color-surface);
-  --akasha-surface-2: var(--color-surface-2);
-  --akasha-surface-3: var(--color-surface-3);
-  --akasha-rule: var(--color-border);
-  --akasha-rule-strong: var(--color-border-strong);
-  --akasha-accent: var(--color-accent);
-  --akasha-accent-soft: var(--color-accent-soft);
-  --akasha-lane-seed: var(--color-accent);
-  --akasha-lane-precise: var(--color-success);
-  --akasha-lane-completion: var(--color-warning);
-  --akasha-lane-activation: var(--color-accent);
+  --akasha-ink: var(--ak-color-text-primary);
+  --akasha-muted: var(--ak-color-text-secondary);
+  --akasha-subtle: var(--ak-color-text-muted);
+  --akasha-surface: var(--ak-color-bg-surface-low);
+  --akasha-surface-2: var(--ak-color-bg-surface);
+  --akasha-surface-3: var(--ak-color-bg-surface-high);
+  --akasha-rule: var(--ak-color-border-default);
+  --akasha-rule-strong: var(--ak-color-border-strong);
+  --akasha-accent: var(--ak-color-action-primary);
+  --akasha-accent-soft: var(--ak-color-action-soft);
+  --akasha-lane-seed: var(--ak-color-action-primary);
+  --akasha-lane-precise: var(--ak-color-status-success);
+  --akasha-lane-completion: var(--ak-color-status-warning);
+  --akasha-lane-activation: var(--ak-color-action-primary);
   --akasha-radius: var(--radius-lg, 10px);
   --akasha-radius-sm: var(--radius, 6px);
   --akasha-ease: var(--ease-out, cubic-bezier(0.22, 1, 0.36, 1));
@@ -424,7 +424,7 @@
   display: grid;
   min-width: min(420px, 70vw);
   gap: 5px;
-  color: var(--color-muted);
+  color: var(--ak-color-text-secondary);
   font-size: 12px;
   font-weight: 500;
 }
@@ -433,10 +433,10 @@
   min-height: 40px;
   width: 100%;
   padding: 0 10px;
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--ak-color-border-default);
   border-radius: var(--radius, 6px);
-  color: var(--color-fg);
-  background: var(--color-surface);
+  color: var(--ak-color-text-primary);
+  background: var(--ak-color-bg-surface-low);
   font: inherit;
   font-size: 16px;
 }
@@ -448,7 +448,7 @@
 }
 
 .akasha-filter input:focus-visible {
-  outline: 1px solid var(--color-accent);
+  outline: 1px solid var(--ak-color-action-primary);
   outline-offset: 1px;
 }
 
@@ -456,10 +456,10 @@
   min-width: 52px;
   min-height: 40px;
   padding: 0 12px;
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--ak-color-border-default);
   border-radius: var(--radius, 6px);
-  color: var(--color-fg);
-  background: var(--color-surface-2);
+  color: var(--ak-color-text-primary);
+  background: var(--ak-color-bg-surface);
   cursor: pointer;
   font: inherit;
   font-size: 13px;
@@ -471,8 +471,8 @@
 }
 
 .akasha-filter button:hover:not(:disabled) {
-  border-color: var(--color-border-strong);
-  background: var(--color-surface-3);
+  border-color: var(--ak-color-border-strong);
+  background: var(--ak-color-bg-surface-high);
 }
 
 .akasha-filter button:active:not(:disabled) {
